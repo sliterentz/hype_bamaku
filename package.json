@@ -1,0 +1,21 @@
+{
+  "name": "hype-bamaku",
+  "private": true,
+  "packageManager": "pnpm@10.30.3",
+  "devDependencies": {
+    "@types/node": "^22.19.13",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@pulumi/command": "^1.2.0",
+    "@pulumi/kubernetes": "^4.26.0",
+    "@pulumi/pulumi": "^3.224.0",
+    "js-yaml": "^4.1.1",
+    "zod": "^3.25.76"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "check": "npm run lint"
+  }
+}

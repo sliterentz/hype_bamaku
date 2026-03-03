@@ -1,0 +1,37 @@
+config:
+  hype-bamaku:env: dev
+
+  hyperv:switchName: ExternalSwitch
+  hyperv:externalAdapterName: Wi-Fi
+  hyperv:vmPath: C:\\HyperV\\VMs
+  hyperv:baseVhdxPath: C:\\Images\\ubuntu-24.04-base.vhdx
+
+  network:cidr: 192.168.0.0/24
+  network:gateway: 192.168.0.1
+  network:dnsServers:
+    - 1.1.1.1
+    - 8.8.8.8
+  network:interfaceName: eth0
+  network:metallbAddressPool: 192.168.0.200-192.168.0.210
+
+  ssh:username: ubuntu
+  ssh:publicKey: "ssh-ed25519 AAAA..."
+  ssh:privateKeyPath: C:\\Users\\you\\.ssh\\id_ed25519
+
+  nodes:controlPlaneCount: 1
+  nodes:workerCount: 2
+  nodes:vcpu: 4
+  nodes:memoryMb: 8192
+  nodes:diskGb: 20
+  nodes:controlPlaneHostnames:
+    - "node-master-01"
+  nodes:workerHostnames:
+    - "node-worker-01"
+    - "node-worker-02"
+  nodes:controlPlaneIps:
+    - 192.168.0.11
+  nodes:workerIps:
+    - 192.168.0.12
+    - 192.168.0.13
+
+  kubernetes:version: 1.30.0

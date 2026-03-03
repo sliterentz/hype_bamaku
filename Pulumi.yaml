@@ -1,0 +1,4 @@
+name: hype-bamaku
+runtime: nodejs
+description: Hyper-V bare-metal Kubernetes homelab via Pulumi (kubeadm + MetalLB + Ingress + Observability)
+main: src/index.ts

@@ -1,0 +1,41 @@
+config:
+  hype-bamaku:env: prod
+
+  hyperv:switchName: ExternalSwitch
+  hyperv:externalAdapterName: Ethernet
+  hyperv:vmPath: C:\\HyperV\\VMs
+  hyperv:baseVhdxPath: C:\\Images\\ubuntu-24.04-base.vhdx
+
+  network:cidr: 192.168.0.0/24
+  network:gateway: 192.168.0.1
+  network:metallbAddressPool: 192.168.0.200-192.168.0.210
+
+  ssh:username: ubuntu
+  ssh:publicKey: "ssh-ed25519 AAAA..."
+  ssh:privateKeyPath: C:\\Users\\you\\.ssh\\id_ed25519
+
+  nodes:controlPlaneCount: 3
+  nodes:workerCount: 2
+  nodes:vcpu: 4
+  nodes:memoryMb: 8192
+  nodes:diskGb: 20
+  nodes:controlPlaneHostnames:
+    - "node-master-01"
+    - "node-master-02"
+    - "node-master-03"
+  nodes:workerHostnames:
+    - "node-worker-01"
+    - "node-worker-02"
+  nodes:controlPlaneIps:
+    - 192.168.0.11
+    - 192.168.0.14
+    - 192.168.0.15
+  nodes:workerIps:
+    - 192.168.0.12
+    - 192.168.0.13
+
+  kubernetes:apiVip: 192.168.0.10
+
+  ingress:baseDomain: k8s.home.arpa
+  ingress:tlsMode: letsencrypt
+  ingress:letsEncryptEmail: you@example.com
