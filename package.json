@@ -4,6 +4,7 @@
   "packageManager": "pnpm@10.30.3",
   "devDependencies": {
     "@types/node": "^22.19.13",
+    "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },
   "dependencies": {
@@ -16,6 +17,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "check": "npm run lint"
+    "check": "npm run lint",
+    "test": "jest"
   }
 }
