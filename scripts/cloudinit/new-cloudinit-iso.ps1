@@ -48,27 +48,60 @@ public class StreamBridge {
 
 Add-Type -TypeDefinition $streamBridgeCode -ErrorAction SilentlyContinue
 
+function Remove-FileWithRetry([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+
+  $maxRetries = 5
+  $retryCount = 0
+  $baseDelay = 1 # seconds
+
+  while ($retryCount -lt $maxRetries) {
+    try {
+      # Try to rename first as a lock check
+      $tempName = $Path + ".deleting." + [Guid]::NewGuid().ToString()
+      Rename-Item -LiteralPath $Path -NewName $tempName -ErrorAction Stop
+      Remove-Item -LiteralPath $tempName -Force -ErrorAction Stop
+      return
+    } catch {
+      $retryCount++
+      if ($retryCount -ge $maxRetries) {
+        Write-Error "Failed to remove file '$Path' after $maxRetries attempts. The file might be locked by another process (e.g., Hyper-V VM)."
+        throw $_
+      }
+      
+      $delay = $baseDelay * [Math]::Pow(2, $retryCount - 1)
+      Write-Warning "File '$Path' is locked. Retrying removal in $delay seconds (Attempt $retryCount/$maxRetries)..."
+      Start-Sleep -Seconds $delay
+    }
+  }
+}
+
 function New-IsoFile(
   [Parameter(Mandatory=$true)][string]$Path,
   [Parameter(Mandatory=$true)][string]$SourceDir,
   [string]$VolumeName = 'CIDATA'
 ) {
-  if (Test-Path -LiteralPath $Path) {
-    Remove-Item -LiteralPath $Path -Force
-  }
+  Remove-FileWithRetry -Path $Path
 
   $fsi = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
-  $fsi.FileSystemsToCreate = 1 # ISO9660
-  $fsi.VolumeName = $VolumeName
-  $fsi.Root.AddTree($SourceDir, $false)
-
-  $result = $fsi.CreateResultImage()
   
   try {
-      [StreamBridge]::SaveIStreamToFile($result.ImageStream, $Path)
-  } catch {
-      Write-Error "Gagal menulis ISO menggunakan StreamBridge: $_"
-      throw $_
+    $fsi.FileSystemsToCreate = 1 # ISO9660
+    $fsi.VolumeName = $VolumeName
+    $fsi.Root.AddTree($SourceDir, $false)
+
+    $result = $fsi.CreateResultImage()
+    
+    try {
+        [StreamBridge]::SaveIStreamToFile($result.ImageStream, $Path)
+    } catch {
+        Write-Error "Gagal menulis ISO menggunakan StreamBridge: $_"
+        throw $_
+    }
+  } finally {
+    if ($fsi) {
+      [System.Runtime.InteropServices.Marshal]::ReleaseComObject($fsi) | Out-Null
+    }
   }
 }
 
@@ -96,6 +129,7 @@ Write-TextFileUtf8NoBom -Path $networkConfigPath -Content $networkConfig
 # Coba oscdimg dulu karena lebih reliable
 $oscdimg = Get-Command oscdimg.exe -ErrorAction SilentlyContinue
 if ($oscdimg) {
+    Remove-FileWithRetry -Path $IsoPath
     & $oscdimg.Path -n -m -lcidata "$workDir" "$IsoPath"
     if ($LASTEXITCODE -ne 0) {
       throw "oscdimg gagal dengan exit code $LASTEXITCODE"

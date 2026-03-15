@@ -6,6 +6,7 @@ import { findRepoFile } from "../utils/paths";
 
 export function ensureVm(name: string, spec: VmSpec, dependsOn?: pulumi.Input<pulumi.Resource>[]) {
   const secureBoot = spec.secureBoot ? "$true" : "$false";
+  const adoptExisting = spec.adoptExisting ? "$true" : "$false";
   const scriptPath = findRepoFile("scripts", "hyperv", "ensure-vm.ps1");
   const scriptDir = path.dirname(scriptPath);
   
@@ -25,7 +26,7 @@ export function ensureVm(name: string, spec: VmSpec, dependsOn?: pulumi.Input<pu
         $ErrorActionPreference = 'Stop'
         $script = '${scriptPath}'
         if (-not (Test-Path -LiteralPath $script)) { throw "Script tidak ditemukan: $script" }
-        & $script -Name '${spec.name}' -SwitchName '${spec.switchName}' -VmPath '${spec.vmPath}' -BaseVhdxPath '${spec.baseVhdxPath}' -DifferencingDiskPath '${spec.differencingDiskPath}' -CloudInitIsoPath '${isoPath}' -CpuCount ${spec.vcpu} -MemoryMb ${spec.memoryMb} -DiskGb ${spec.diskGb} -SecureBoot ${secureBoot}
+        & $script -Name '${spec.name}' -SwitchName '${spec.switchName}' -VmPath '${spec.vmPath}' -BaseVhdxPath '${spec.baseVhdxPath}' -DifferencingDiskPath '${spec.differencingDiskPath}' -CloudInitIsoPath '${isoPath}' -CpuCount ${spec.vcpu} -MemoryMb ${spec.memoryMb} -DiskGb ${spec.diskGb} -SecureBoot ${secureBoot} -AdoptExisting ${adoptExisting}
       `,
       delete: pulumi.interpolate`
         $ErrorActionPreference = 'Stop'
@@ -45,6 +46,7 @@ export function ensureVm(name: string, spec: VmSpec, dependsOn?: pulumi.Input<pu
         `${spec.memoryMb}`,
         `${spec.diskGb}`,
         `${spec.secureBoot}`,
+        `${adoptExisting}`,
         spec.instanceId ?? ""
       ]
     },

@@ -55,7 +55,7 @@ export function installAddons(name: string, cfg: AppConfig, provider: k8s.Provid
       fetchOpts: { repo: "https://docs.tigera.io/calico/charts" },
       values: {
         installation: {
-          kubernetesProvider: "k8s",
+          kubernetesProvider: "",
           calicoNetwork: {
             ipPools: [
               {
@@ -251,15 +251,60 @@ export function installAddons(name: string, cfg: AppConfig, provider: k8s.Provid
         chart: "loki",
         fetchOpts: { repo: "https://grafana.github.io/helm-charts" },
         values: {
+          deploymentMode: "SingleBinary",
           loki: {
-            commonConfig: { replication_factor: cfg.env === "prod" ? 3 : 1 },
+            auth_enabled: false,
+            commonConfig: {
+              replication_factor: cfg.env === "prod" ? 3 : 1
+            },
             storage: {
               type: "filesystem"
+            },
+            schemaConfig: {
+              configs: [{
+                from: "2024-01-01",
+                store: "boltdb-shipper",
+                object_store: "filesystem",
+                schema: "v11",
+                index: {
+                  prefix: "index_",
+                  period: "24h"
+                }
+              }]
+            },
+            storageConfig: {
+              boltdb_shipper: {
+                shared_store: "filesystem",
+                active_index_directory: "/var/loki/index",
+                cache_location: "/var/loki/cache",
+                cache_ttl: "24h"
+              },
+              filesystem: {
+                directory: "/var/loki/chunks"
+              }
+            },
+            limits_config: {
+              retention_period: "168h"
+            },
+            compactor: {
+              working_directory: "/var/loki/compactor",
+              shared_store: "filesystem",
+              compaction_interval: "10m",
+              retention_enabled: true,
+              retention_delete_delay: "2h",
+              retention_delete_worker_count: 150
             }
           },
           singleBinary: {
-            replicas: cfg.env === "prod" ? 3 : 1
-          }
+            replicas: cfg.env === "prod" ? 3 : 1,
+            persistence: {
+              enabled: true,
+              size: "10Gi"
+            }
+          },
+          read: { replicas: 0 },
+          write: { replicas: 0 },
+          backend: { replicas: 0 }
         }
       },
       { provider, dependsOn: [namespaces.logging] }

@@ -13,6 +13,10 @@ export function findRepoFile(...segments: string[]): string {
   candidates.push(path.resolve(__dirname, "..", "..", ...segments));
   candidates.push(path.resolve(__dirname, "..", "..", "..", ...segments));
 
+  // Try finding from git root or common project structure if possible
+  // Assuming src/utils/paths.ts location, repo root is ../..
+  candidates.push(path.resolve(__dirname, "..", "..", ...segments));
+
   for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }

@@ -8,7 +8,8 @@ param(
   [Parameter(Mandatory=$true)][int]$CpuCount,
   [Parameter(Mandatory=$true)][int]$MemoryMb,
   [Parameter(Mandatory=$true)][int]$DiskGb,
-  [Parameter(Mandatory=$true)][bool]$SecureBoot
+  [Parameter(Mandatory=$true)][bool]$SecureBoot,
+  [Parameter(Mandatory=$false)][bool]$AdoptExisting = $false
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,8 +64,56 @@ try {
 
 if ($null -eq $vm) {
   Ensure-Dir $VmPath
-  New-VM -Name $Name -Generation 2 -Path $VmPath -MemoryStartupBytes ($MemoryMb * 1MB) -SwitchName $SwitchName -VHDPath $DifferencingDiskPath | Out-Null
+  
+  # Check for Hyper-V Administrators group membership (Diagnostic only)
+  try {
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object System.Security.Principal.WindowsPrincipal($currentUser)
+    $isAdmin = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    
+    if (-not $isAdmin) {
+        Write-Warning "Running as non-Administrator. This may cause permission issues with New-VM."
+    }
+  } catch {
+    # Ignore errors during check
+  }
+
+  try {
+    New-VM -Name $Name -Generation 2 -Path $VmPath -MemoryStartupBytes ($MemoryMb * 1MB) -SwitchName $SwitchName -VHDPath $DifferencingDiskPath -ErrorAction Stop | Out-Null
+  } catch {
+    if ($_.Exception.Message -match "authorization policy") {
+        Write-Error "PERMISSION DENIED: The user '$env:USERNAME' does not have permission to create VMs on '$env:COMPUTERNAME'."
+        Write-Error "POSSIBLE FIXES:"
+        Write-Error "1. Run PowerShell/Pulumi as Administrator."
+        Write-Error "2. Add user '$env:USERNAME' to the local 'Hyper-V Administrators' group."
+        Write-Error "   (Run: Add-LocalGroupMember -Group 'Hyper-V Administrators' -Member '$env:USERNAME')"
+        Write-Error "   NOTE: You must LOG OFF and LOG IN again for group membership to take effect."
+        Write-Error "3. Check 'azman.msc' -> Hyper-V -> Role Assignments."
+    }
+    throw $_
+  }
 } else {
+  if ($AdoptExisting) {
+    Write-Output "VM '$Name' exists. Adopting..."
+    
+    if ($vm.State -eq 'Running') {
+        # Check if ISO is different
+        $dvd = Get-VMDvdDrive -VMName $Name -ErrorAction SilentlyContinue
+        if ($dvd.Path -ne $CloudInitIsoPath) {
+             Write-Warning "ISO mismatch on running VM '$Name'. Expected: '$CloudInitIsoPath', Found: '$($dvd.Path)'. Updating ISO..."
+             Set-VMDvdDrive -VMName $Name -Path $CloudInitIsoPath | Out-Null
+        } else {
+             Write-Output "ISO matches on VM '$Name'."
+        }
+        
+        # Return OK to signal success without restart
+        Write-Output "ok:$Name"
+        return
+    } else {
+        Write-Output "VM '$Name' exists but is not running. Proceeding with configuration update..."
+    }
+  }
+
   $vm | Stop-VM -TurnOff -Force -ErrorAction SilentlyContinue | Out-Null
 }
 

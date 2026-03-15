@@ -1,5 +1,6 @@
 import * as pulumi from "@pulumi/pulumi";
 import { z } from "zod";
+import { validateUniqueHostnames } from "./utils/hostnames";
 
 const ConfigSchema = z.object({
   env: z.enum(["dev", "staging", "prod"]).default("dev"),
@@ -10,7 +11,8 @@ const ConfigSchema = z.object({
     vmPath: z.string().min(1).default("C:\\HyperV\\VMs"),
     baseVhdxPath: z.string().min(1),
     isoOutputDir: z.string().min(1).default(".pulumi-artifacts"),
-    secureBoot: z.boolean().default(true)
+    secureBoot: z.boolean().default(true),
+    adoptExisting: z.boolean().default(false)
   }),
 
   network: z.object({
@@ -87,7 +89,8 @@ export function loadConfig(): AppConfig {
       vmPath: hypervCfg.get("vmPath") ?? undefined,
       baseVhdxPath: hypervCfg.require("baseVhdxPath"),
       isoOutputDir: hypervCfg.get("isoOutputDir") ?? undefined,
-      secureBoot: hypervCfg.getBoolean("secureBoot") ?? undefined
+      secureBoot: hypervCfg.getBoolean("secureBoot") ?? undefined,
+      adoptExisting: hypervCfg.getBoolean("adoptExisting") ?? undefined
     },
     network: {
       cidr: networkCfg.require("cidr"),
@@ -156,6 +159,26 @@ export function loadConfig(): AppConfig {
 
   if (parsed.env === "prod" && !parsed.kubernetes.apiVip) {
     throw new Error("kubernetes:apiVip wajib untuk HA API endpoint pada env=prod.");
+  }
+
+  // Validate Hostnames Uniqueness
+  const allHostnames: string[] = [];
+  if (parsed.nodes.controlPlaneHostnames) {
+    allHostnames.push(...parsed.nodes.controlPlaneHostnames);
+  }
+  if (parsed.nodes.workerHostnames) {
+    allHostnames.push(...parsed.nodes.workerHostnames);
+  }
+  if (allHostnames.length > 0) {
+    validateUniqueHostnames(allHostnames);
+  }
+
+  // Ensure hostname lists match counts if provided
+  if (parsed.nodes.controlPlaneHostnames && parsed.nodes.controlPlaneHostnames.length !== parsed.nodes.controlPlaneCount) {
+    throw new Error(`nodes:controlPlaneHostnames length (${parsed.nodes.controlPlaneHostnames.length}) must match nodes:controlPlaneCount (${parsed.nodes.controlPlaneCount}).`);
+  }
+  if (parsed.nodes.workerHostnames && parsed.nodes.workerHostnames.length !== parsed.nodes.workerCount) {
+    throw new Error(`nodes:workerHostnames length (${parsed.nodes.workerHostnames.length}) must match nodes:workerCount (${parsed.nodes.workerCount}).`);
   }
 
   return parsed;

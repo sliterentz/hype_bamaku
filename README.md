@@ -60,7 +60,15 @@ pulumi config set ssh:privateKeyPath "C:\\Users\\you\\.ssh\\id_ed25519"
 
 pulumi config set --path nodes:controlPlaneIps[0] "192.168.0.11"
 pulumi config set --path nodes:workerIps[0] "192.168.0.12"
-pulumi config set --path nodes:workerIps[1] "192.168.0.13"
+pulumi config set ssh:privateKeyPath "C:\\Users\\you\\.ssh\\id_ed25519"
+
+# PENTING: Konfigurasi SSH untuk Otomasi
+# Agar 'pulumi up' berjalan tanpa intervensi manual (headless), pastikan:
+# 1. Private key tidak diproteksi passphrase (atau gunakan ssh-agent).
+# 2. Private key memiliki permission terbatas (hanya owner).
+#    - Windows: Klik kanan file -> Properties -> Security -> Advanced -> Disable Inheritance -> Remove all inherited permissions -> Add your user (Full Control).
+#    - Linux/WSL: chmod 600 ~/.ssh/id_ed25519
+# 3. Public key yang didaftarkan di config 'ssh:publicKey' adalah pasangan yang valid dari 'ssh:privateKeyPath'.
 ```
 
 Catatan: jika Anda mengedit file stack `Pulumi.<stack>.yaml` manual, kunci config harus mengikuti format `<namespace>:<name>` (satu `:`). Contoh yang benar: `network:gateway`, bukan `hype-bamaku:network:gateway`.

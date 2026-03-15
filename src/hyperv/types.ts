@@ -9,5 +9,6 @@ export interface VmSpec {
   memoryMb: number;
   diskGb: number;
   secureBoot: boolean;
+  adoptExisting?: boolean;
   instanceId?: string;
 }

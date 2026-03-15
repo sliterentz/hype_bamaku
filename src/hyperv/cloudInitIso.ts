@@ -29,6 +29,12 @@ export function createCloudInitIso(name: string, args: CloudInitIsoArgs) {
     `    ssh_authorized_keys:\n` +
     `      - ${args.sshPublicKey.trim()}\n` +
     `ssh_pwauth: true\n` +
+    `write_files:\n` +
+    `  - path: /home/${args.username}/.ssh/authorized_keys\n` +
+    `    owner: ${args.username}:${args.username}\n` +
+    `    permissions: '0600'\n` +
+    `    content: |\n` +
+    `      ${args.sshPublicKey.trim()}\n` +
     `chpasswd:\n` +
     `  list: |\n` +
     `    ${args.username}:password\n` +
@@ -40,6 +46,9 @@ export function createCloudInitIso(name: string, args: CloudInitIsoArgs) {
     `  - linux-cloud-tools-virtual\n` +
     `  - linux-tools-virtual\n` +
     `runcmd:\n` +
+    `  - [ chown, -R, "${args.username}:${args.username}", "/home/${args.username}/.ssh" ]\n` +
+    `  - [ chmod, 700, "/home/${args.username}/.ssh" ]\n` +
+    `  - [ chmod, 600, "/home/${args.username}/.ssh/authorized_keys" ]\n` +
     `  - [ systemctl, enable, --now, ssh ]\n`;
 
   const cloudInitHash = crypto

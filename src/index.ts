@@ -56,6 +56,7 @@ function makeVm(name: string, hostname: string, ip: string) {
     memoryMb: cfg.nodes.memoryMb,
     diskGb: cfg.nodes.diskGb,
     secureBoot: cfg.hyperv.secureBoot,
+    adoptExisting: cfg.hyperv.adoptExisting,
     // Pass the trigger string as the instanceId so ensureVm replaces the VM when ISO changes
     instanceId: instanceIdTrigger as any
   };
@@ -80,14 +81,16 @@ const controlPlanes = buildNodeHandles(
   cpIps,
   vmResources,
   cfg.ssh.username,
-  cfg.ssh.privateKeyPath
+  cfg.ssh.privateKeyPath,
+  cfg.ssh.publicKey
 );
 const workers = buildNodeHandles(
   `${stack}-w`,
   workerIps,
   vmResources,
   cfg.ssh.username,
-  cfg.ssh.privateKeyPath
+  cfg.ssh.privateKeyPath,
+  cfg.ssh.publicKey
 );
 
 const bootstrap = bootstrapKubeadmCluster("kubeadm", cfg, { controlPlanes, workers });
