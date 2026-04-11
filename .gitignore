@@ -1,3 +1,33 @@
+# claude files
+.claude
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.trae
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# SSH Keys
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+
+# Pulumi
+.pulumi/
+.pulumi-artifacts/
+.pulumi-home*/
+.pulumi-state*/
+.pulumi-passphrase*
+credentials.json
+Pulumi.dev.*
+
 # Local .terraform directories
 .terraform/
 

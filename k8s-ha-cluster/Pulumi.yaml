@@ -1,0 +1,4 @@
+name: k8s-ha-cluster
+runtime: go
+description: A 2-Node HA Kubernetes Cluster on Hyper-V using Hybrid Pulumi + Terraform
+main: ./cmd
