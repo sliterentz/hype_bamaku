@@ -37,9 +37,24 @@ func provisionMockNodes(ctx *pulumi.Context, cfg *config.Config) ([]*Node, error
 
     ctx.Log.Warn("🔧 MOCK MODE: Menggunakan IP statis untuk development", nil)
 
+    // Generate IP addresses dari range yang dikonfigurasi
+    controlPlaneIPs, err := cfg.GenerateControlPlaneIPs()
+    if err != nil {
+        return nil, fmt.Errorf("gagal generate control plane IPs: %w", err)
+    }
+
+    // Validasi jumlah IP yang tersedia
+    if len(controlPlaneIPs) < cfg.HyperVNodeCount {
+        return nil, fmt.Errorf("jumlah IP yang tersedia (%d) kurang dari jumlah node yang dibutuhkan (%d)", 
+            len(controlPlaneIPs), cfg.HyperVNodeCount)
+    }
+
     for i := 0; i < cfg.HyperVNodeCount; i++ {
-        nodeName := fmt.Sprintf("cp-node-%d", i+1)
-        mockIP := fmt.Sprintf("192.168.1.%d", 15+i)
+        // Gunakan hostname prefix dari config
+        nodeName := fmt.Sprintf("%s-%d", cfg.K8sCPHostnamePrefix, i+1)
+
+        // Gunakan IP dari range yang sudah digenerate
+        mockIP := controlPlaneIPs[i]
 
         nodes = append(nodes, &Node{
             Name:      nodeName,

@@ -7,6 +7,7 @@
 *.swp
 *.swo
 .trae
+docs/
 
 # Environment files
 .env
@@ -27,6 +28,7 @@ id_rsa.pub
 .pulumi-passphrase*
 credentials.json
 Pulumi.dev.*
+dist/
 
 # Local .terraform directories
 .terraform/
@@ -65,3 +67,5 @@ override.tf.json
 # Ignore CLI configuration files
 .terraformrc
 terraform.rc
+
+node_modules

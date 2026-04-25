@@ -21,9 +21,9 @@ func SetupVIP(ctx *pulumi.Context, cfg *config.Config, nodes []*hyperv.Node) (*V
 		// Deploy Kube-VIP static pod manifest ke setiap node control-plane
 		_, err := remote.NewCommand(ctx, fmt.Sprintf("setup-kube-vip-%d", i), &remote.CommandArgs{
 			Connection: &remote.ConnectionArgs{
-				Host: 			node.IPAddress,
-				User: 			pulumi.String("ubuntu"),
-				PrivateKey:     pulumi.String(cfg.SSHPrivateKey), // Dari config atau ESC
+				Host:       node.IPAddress,
+				User:       pulumi.String(cfg.SSHUser),
+				PrivateKey: cfg.SSHPrivateKey, // Dari config atau ESC
 			},
 			Create: pulumi.Sprintf(`
 				sudo mkdir -p /etc/kubernetes/manifests &&

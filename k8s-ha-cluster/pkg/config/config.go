@@ -5,6 +5,7 @@ import (
     "net"
     "os"
     "strconv"
+    "encoding/base64"
 
 	"github.com/joho/godotenv"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -44,7 +45,7 @@ type Config struct {
 
 	// SSH Configuration
     SSHUser           string
-	SSHPrivateKey     string
+	SSHPrivateKey     pulumi.StringInput
 
 	// GitOps Configuration
 	GitOpsRepoURL      	string
@@ -61,18 +62,17 @@ type Config struct {
 }
 
 func LoadConfig(ctx *pulumi.Context) (*Config, error) {
-    // Load .env file dengan error handling yang lebih baik
-    envPath := ".env"
+    // 1. Load .env file dengan absolute/cwd path agar terbaca saat pulumi up/preview
+    cwd, _ := os.Getwd()
+    envPath := cwd + "/.env"
     if customPath := os.Getenv("ENV_FILE_PATH"); customPath != "" {
         envPath = customPath
     }
 
     if err := godotenv.Load(envPath); err != nil {
-        // Hanya warning jika file tidak ada, bukan error lain
         if os.IsNotExist(err) {
-            fmt.Printf("ℹ️  Info: %s not found, using environment variables or defaults\n", envPath)
+            fmt.Printf("ℹ️  Info: %s not found, using Pulumi Config, environment variables, or defaults\n", envPath)
         } else {
-            // Error lain (permission, format, dll) harus di-handle
             return nil, fmt.Errorf("failed to load %s: %w", envPath, err)
         }
     } else {
@@ -80,81 +80,155 @@ func LoadConfig(ctx *pulumi.Context) (*Config, error) {
     }
 
     cfg := &Config{}
-	pulumiCfg := pulumiConfig.New(ctx, "")
+    pulumiCfg := pulumiConfig.New(ctx, "")
+
+    // Fungsi helper untuk membaca Config dengan urutan prioritas:
+    // 1. Pulumi Config
+    // 2. Environment Variable (dari .env atau OS)
+    // 3. Default Value
+    getConfigStr := func(configKey, envKey, defaultVal string) string {
+        if val := pulumiCfg.Get(configKey); val != "" {
+            return val
+        }
+        if val := os.Getenv(envKey); val != "" {
+            return val
+        }
+        return defaultVal
+    }
+
+    getConfigInt := func(configKey, envKey string, defaultVal int) int {
+        if valStr := pulumiCfg.Get(configKey); valStr != "" {
+            if val, err := strconv.Atoi(valStr); err == nil {
+                return val
+            }
+        }
+        if valStr := os.Getenv(envKey); valStr != "" {
+            if val, err := strconv.Atoi(valStr); err == nil {
+                return val
+            }
+        }
+        return defaultVal
+    }
+
+    getConfigBool := func(configKey, envKey string, defaultVal bool) bool {
+        if valStr := pulumiCfg.Get(configKey); valStr != "" {
+            if val, err := strconv.ParseBool(valStr); err == nil {
+                return val
+            }
+        }
+        if valStr := os.Getenv(envKey); valStr != "" {
+            if val, err := strconv.ParseBool(valStr); err == nil {
+                return val
+            }
+        }
+        return defaultVal
+    }
 
     // Hyper-V Configuration
-    cfg.HyperVNodeCount = getEnvAsInt("HYPERV_NODE_COUNT", 2)
-    cfg.HyperVCPUs = getEnvAsInt("HYPERV_CPUS", 4)
-    cfg.HyperVMemoryGB = getEnvAsInt("HYPERV_MEMORY_GB", 8)
-    cfg.HyperVDiskGB = getEnvAsInt("HYPERV_DISK_GB", 50)
-    cfg.HyperVNetworkSwitch = getEnv("HYPERV_NETWORK_SWITCH", "DefaultSwitch")
-    cfg.HyperVImageURL = getEnv("HYPERV_IMAGE_URL", "")
+    cfg.HyperVNodeCount = getConfigInt("hypervNodeCount", "HYPERV_NODE_COUNT", 2)
+    cfg.HyperVCPUs = getConfigInt("hypervCpus", "HYPERV_CPUS", 4)
+    cfg.HyperVMemoryGB = getConfigInt("hypervMemoryGB", "HYPERV_MEMORY_GB", 8)
+    cfg.HyperVDiskGB = getConfigInt("hypervDiskGB", "HYPERV_DISK_GB", 50)
+    cfg.HyperVNetworkSwitch = getConfigStr("hypervNetworkSwitch", "HYPERV_NETWORK_SWITCH", "DefaultSwitch")
+    cfg.HyperVImageURL = getConfigStr("hypervImageURL", "HYPERV_IMAGE_URL", "")
 
     // Kubernetes Control Plane Configuration
-    cfg.K8sCPHostnamePrefix = getEnv("K8S_CP_HOSTNAME_PREFIX", "k8s-ha-cp")
-    cfg.K8sCPIPStart = getEnv("K8S_CP_IP_START", "192.168.1.101")
-    cfg.K8sCPIPEnd = getEnv("K8S_CP_IP_END", "192.168.1.102")
-    cfg.K8sCPIPCIDR = getEnvAsInt("K8S_CP_IP_CIDR", 24)
-    cfg.K8sVersion = getEnv("K8S_VERSION", "v1.35.0")
-    cfg.K8sPodCIDR = getEnv("K8S_POD_CIDR", "10.244.0.0/16")
-    cfg.K8sServiceCIDR = getEnv("K8S_SERVICE_CIDR", "10.96.0.0/12")
+    cfg.K8sCPHostnamePrefix = getConfigStr("k8sCPHostnamePrefix", "K8S_CP_HOSTNAME_PREFIX", "k8s-ha-cp")
+    cfg.K8sCPIPStart = getConfigStr("k8sCPIPStart", "K8S_CP_IP_START", "192.168.1.101")
+    cfg.K8sCPIPEnd = getConfigStr("k8sCPIPEnd", "K8S_CP_IP_END", "192.168.1.102")
+    cfg.K8sCPIPCIDR = getConfigInt("k8sCPIPCIDR", "K8S_CP_IP_CIDR", 24)
+    cfg.K8sVersion = getConfigStr("k8sVersion", "K8S_VERSION", "v1.35.0")
+    cfg.K8sPodCIDR = getConfigStr("k8sPodCIDR", "K8S_POD_CIDR", "10.244.0.0/16")
+    cfg.K8sServiceCIDR = getConfigStr("k8sServiceCIDR", "K8S_SERVICE_CIDR", "10.96.0.0/12")
 
     // Virtual IP Configuration
-	cfg.K8sDOMAIN = getEnv("K8S_DOMAIN", "localhost")
-    cfg.K8sVIP = getEnv("K8S_VIP", "192.168.1.100")
-    cfg.K8sVIPInterface = getEnv("K8S_VIP_INTERFACE", "eth0")
-    cfg.K8sVIPARPEnabled = getEnvAsBool("K8S_VIP_ARP_ENABLED", true)
-    cfg.K8sVIPLeaderElection = getEnvAsBool("K8S_VIP_LEADER_ELECTION", true)
+    cfg.K8sDOMAIN = getConfigStr("k8sDomain", "K8S_DOMAIN", "localhost")
+    cfg.K8sVIP = getConfigStr("controlPlaneVIP", "K8S_VIP", "192.168.1.100")
+    cfg.K8sVIPInterface = getConfigStr("k8sVIPInterface", "K8S_VIP_INTERFACE", "eth0")
+    cfg.K8sVIPARPEnabled = getConfigBool("k8sVIPARPEnabled", "K8S_VIP_ARP_ENABLED", true)
+    cfg.K8sVIPLeaderElection = getConfigBool("k8sVIPLeaderElection", "K8S_VIP_LEADER_ELECTION", true)
 
     // MetalLB Configuration
-    cfg.K8sMetalLBEnabled = getEnvAsBool("K8S_METALLB_ENABLED", true)
-    cfg.K8sMetalLBIPRangeStart = getEnv("K8S_METALLB_IP_RANGE_START", "192.168.1.105")
-    cfg.K8sMetalLBIPRangeEnd = getEnv("K8S_METALLB_IP_RANGE_END", "192.168.1.110")
-    cfg.K8sMetalLBAddressPoolName = getEnv("K8S_METALLB_ADDRESS_POOL_NAME", "default-pool")
+    cfg.K8sMetalLBEnabled = getConfigBool("k8sMetalLBEnabled", "K8S_METALLB_ENABLED", true)
+    cfg.K8sMetalLBIPRangeStart = getConfigStr("metallbStart", "K8S_METALLB_IP_RANGE_START", "192.168.1.105")
+    cfg.K8sMetalLBIPRangeEnd = getConfigStr("metallbEnd", "K8S_METALLB_IP_RANGE_END", "192.168.1.110")
+    cfg.K8sMetalLBAddressPoolName = getConfigStr("k8sMetalLBAddressPoolName", "K8S_METALLB_ADDRESS_POOL_NAME", "default-pool")
 
-	// SSH Configuration
-	// Untuk production, gunakan Pulumi ESC atau Secret Manager
-    cfg.SSHUser = getEnv("SSH_USER", "ubuntu")
+    // SSH Configuration
+    cfg.SSHUser = getConfigStr("sshUser", "SSH_USER", "ubuntu")
 
-	// Load SSH Private Key dengan prioritas:
+    // Load SSH Private Key dengan prioritas:
     // 1. Dari Pulumi Config (encrypted secret)
     // 2. Dari environment variable
     // 3. Dari file path
-    cfg.SSHPrivateKey = pulumiCfg.Get("sshPrivateKey")
-    if cfg.SSHPrivateKey == "" {
-        cfg.SSHPrivateKey = os.Getenv("SSH_PRIVATE_KEY")
+    sshKeyLoaded := false
+
+    // Coba baca dari Pulumi Config (Get() bisa membaca plain text maupun secret yang sudah di-decrypt)
+    if sshKey, err := pulumiCfg.TrySecret("sshPrivateKey"); err == nil {
+        cfg.SSHPrivateKey = sshKey
+        sshKeyLoaded = true
+        fmt.Println("✅ SSH Private Key loaded from Pulumi Config")
     }
-    if cfg.SSHPrivateKey == "" {
-		// Fallback: baca dari file jika tidak ada di Pulumi config
-        keyPath := getEnv("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_rsa")
+
+    // Jika tidak ada di Pulumi Secret, coba environment variable
+    if !sshKeyLoaded {
+        if envKey := os.Getenv("SSH_PRIVATE_KEY"); envKey != "" {
+            
+            // Decode SSH private key dari base64
+            sshKeyBytes, err := base64.StdEncoding.DecodeString(envKey)
+            if err != nil {
+                return nil, fmt.Errorf("failed to decode SSH private key: %w", err)
+            }
+            cfg.SSHPrivateKey = pulumi.ToSecret(pulumi.String(string(sshKeyBytes))).(pulumi.StringInput)
+            // cfg.SSHPrivateKey = envKey
+            sshKeyLoaded = true
+            fmt.Println("✅ SSH Private Key loaded from Environment Variable")
+        }
+    }
+
+    // Jika masih belum ada, coba baca dari file
+    if !sshKeyLoaded {
+        keyPath := getConfigStr("sshPrivateKeyPath", "SSH_PRIVATE_KEY_PATH", "~/.ssh/id_rsa")
         expandedPath := os.ExpandEnv(keyPath)
-        if expandedPath[:2] == "~/" {
-            homeDir, _ := os.UserHomeDir()
-            expandedPath = homeDir + expandedPath[1:]
+        
+        // Handle tilde (~) expansion
+        if len(expandedPath) >= 2 && expandedPath[:2] == "~/" {
+            homeDir, err := os.UserHomeDir()
+            if err == nil {
+                expandedPath = homeDir + expandedPath[1:]
+            }
         }
-        keyBytes, err := os.ReadFile(expandedPath)
-        if err != nil {
-            return nil, fmt.Errorf("❌ Failed to read SSH private key from %s: %w\n"+
-                "Please set SSH key via one of these methods:\n"+
-                "  1. pulumi config set --secret sshPrivateKey < ~/.ssh/id_rsa\n"+
-                "  2. export SSH_PRIVATE_KEY=\"$(cat ~/.ssh/id_rsa)\"\n"+
-                "  3. Set SSH_PRIVATE_KEY_PATH in .env file", expandedPath, err)
+        
+        if keyBytes, err := os.ReadFile(expandedPath); err == nil {
+            cfg.SSHPrivateKey = pulumi.ToSecret(pulumi.String(string(keyBytes))).(pulumi.StringInput)
+            sshKeyLoaded = true
+            fmt.Printf("✅ SSH Private Key loaded from file: %s\n", expandedPath)
+        } else {
+            fmt.Printf("⚠️  Warning: Failed to read SSH private key from %s: %v\n", expandedPath, err)
         }
-        cfg.SSHPrivateKey = string(keyBytes)
+    }
+
+    // Validasi apakah SSH key berhasil dimuat
+    if !sshKeyLoaded || cfg.SSHPrivateKey == nil {
+        fmt.Println("⚠️  WARNING: No SSH private key configured. Remote operations may fail.")
+        fmt.Println("   Set it using one of these methods:")
+        fmt.Println("   1. pulumi config set --secret sshPrivateKey < ~/.ssh/your_key")
+        fmt.Println("   2. export SSH_PRIVATE_KEY=\"$(cat ~/.ssh/your_key)\"")
+        fmt.Println("   3. Set SSH_PRIVATE_KEY_PATH in .env file")
     }
 
     // GitOps Configuration
-    cfg.GitOpsRepoURL = getEnv("GITOPS_REPO_URL", "")
-    cfg.GitOpsBranch = getEnv("GITOPS_BRANCH", "main")
-    cfg.ArgoCDProjectPrefix = getEnv("ARGOCD_PROJECT_PREFIX", "ha-cluster-dev")
+    cfg.GitOpsRepoURL = getConfigStr("gitOpsRepoURL", "GITOPS_REPO_URL", "")
+    cfg.GitOpsBranch = getConfigStr("gitOpsBranch", "GITOPS_BRANCH", "main")
+    cfg.ArgoCDProjectPrefix = getConfigStr("argoCDProjectPrefix", "ARGOCD_PROJECT_PREFIX", "ha-cluster-dev")
 
     // Stack Metadata
-    cfg.PulumiStack = getEnv("PULUMI_STACK", "dev")
-    cfg.PulumiBackend = getEnv("PULUMI_BACKEND", "local")
+    cfg.PulumiStack = getConfigStr("pulumiStack", "PULUMI_STACK", "dev")
+    cfg.PulumiBackend = getConfigStr("pulumiBackend", "PULUMI_BACKEND", "local")
 
-	// Environment Configuration
-    cfg.Environment = getEnv("ENVIRONMENT", "development")
-    cfg.MockMode = getEnvAsBool("MOCK_MODE", cfg.Environment == "development")
+    // Environment Configuration
+    cfg.Environment = getConfigStr("environment", "ENVIRONMENT", "development")
+    cfg.MockMode = getConfigBool("mockMode", "MOCK_MODE", cfg.Environment == "development")
 
     // Validate configuration
     if err := cfg.Validate(); err != nil {
