@@ -46,6 +46,7 @@ type Config struct {
 	// SSH Configuration
     SSHUser           string
 	SSHPrivateKey     pulumi.StringInput
+    SSHPrivateKeyPath string
 
 	// GitOps Configuration
 	GitOpsRepoURL      	string
@@ -142,7 +143,7 @@ func LoadConfig(ctx *pulumi.Context) (*Config, error) {
     cfg.K8sServiceCIDR = getConfigStr("k8sServiceCIDR", "K8S_SERVICE_CIDR", "10.96.0.0/12")
 
     // Virtual IP Configuration
-    cfg.K8sDOMAIN = getConfigStr("k8sDomain", "K8S_DOMAIN", "localhost")
+    cfg.K8sDOMAIN = getConfigStr("k8sDomain", "K8S_VIP_DOMAIN", "localhost")
     cfg.K8sVIP = getConfigStr("controlPlaneVIP", "K8S_VIP", "192.168.1.100")
     cfg.K8sVIPInterface = getConfigStr("k8sVIPInterface", "K8S_VIP_INTERFACE", "eth0")
     cfg.K8sVIPARPEnabled = getConfigBool("k8sVIPARPEnabled", "K8S_VIP_ARP_ENABLED", true)
@@ -156,6 +157,7 @@ func LoadConfig(ctx *pulumi.Context) (*Config, error) {
 
     // SSH Configuration
     cfg.SSHUser = getConfigStr("sshUser", "SSH_USER", "ubuntu")
+    cfg.SSHPrivateKeyPath = getConfigStr("sshPrivateKeyPath", "SSH_PRIVATE_KEY_PATH", "~/.ssh/id_rsa")
 
     // Load SSH Private Key dengan prioritas:
     // 1. Dari Pulumi Config (encrypted secret)
@@ -297,10 +299,12 @@ func (c *Config) PrintSummary() {
     fmt.Printf("🖥️  Hyper-V: %d nodes, %d CPUs, %dGB RAM\n", c.HyperVNodeCount, c.HyperVCPUs, c.HyperVMemoryGB)
     fmt.Printf("🎯 Control Plane: %s (%s - %s)\n", c.K8sCPHostnamePrefix, c.K8sCPIPStart, c.K8sCPIPEnd)
     fmt.Printf("🌐 Virtual IP: %s (%s)\n", c.K8sVIP, c.K8sVIPInterface)
+    fmt.Printf("🔗 VIP Domain: %s\n", c.K8sDOMAIN)
     fmt.Printf("📦 Kubernetes: %s\n", c.K8sVersion)
     fmt.Printf("🔧 Pod CIDR: %s\n", c.K8sPodCIDR)
-    fmt.Printf("⚖️  MetalLB: %s - %s\n", c.K8sMetalLBIPRangeStart, c.K8sMetalLBIPRangeEnd)
+    fmt.Printf("⚖️ MetalLB: %s - %s\n", c.K8sMetalLBIPRangeStart, c.K8sMetalLBIPRangeEnd)
     fmt.Printf("🔐 SSH User: %s\n", c.SSHUser)
+    fmt.Printf("🔐 SSH Private Key Path: %s\n", c.SSHPrivateKeyPath)
     fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 }
 

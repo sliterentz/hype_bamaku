@@ -7,7 +7,6 @@ import (
 	"k8s-ha-cluster/pkg/gitops"
 	"k8s-ha-cluster/pkg/hyperv"
 	"k8s-ha-cluster/pkg/k8s"
-	"k8s-ha-cluster/pkg/network"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
@@ -20,20 +19,27 @@ func main() {
 			return fmt.Errorf("gagal memuat konfigurasi: %w", err)
 		}
 
+		// ✅ VALIDASI: Pastikan config valid sebelum lanjut
+		if err := cfg.Validate(); err != nil {
+			return fmt.Errorf("konfigurasi tidak valid: %w", err)
+		}
+
 		// 2. Provision Hyper-V VMs (Terraform Interop)
 		nodes, err := hyperv.ProvisionNodes(ctx, cfg)
 		if err != nil {
 			return fmt.Errorf("gagal provision node Hyper-V: %w", err)
 		}
 
-		// 3. Setup Virtual IP untuk HA Control Plane (kube-vip)
-		vip, err := network.SetupVIP(ctx, cfg, nodes)
-		if err != nil {
-			return fmt.Errorf("gagal konfigurasi VIP: %w", err)
+		// ✅ VALIDASI: Pastikan nodes tidak kosong
+		if len(nodes) == 0 {
+			return fmt.Errorf("tidak ada node yang berhasil di-provision")
 		}
 
-		// 4. Bootstrap Kubernetes Cluster (kubeadm)
-		cluster, err := k8s.Bootstrap(ctx, cfg, nodes, vip)
+		// ✅ WAIT: Tunggu semua nodes ready sebelum bootstrap
+		ctx.Log.Info("⏳ Waiting for all nodes to be ready...", nil)
+
+		// 3. Bootstrap Kubernetes Cluster untuk HA Control Plane (termasuk VIP setup)
+		cluster, err := k8s.Bootstrap(ctx, cfg, nodes)
 		if err != nil {
 			return fmt.Errorf("gagal bootstrap k8s: %w", err)
 		}
@@ -45,7 +51,13 @@ func main() {
 		}
 
 		// Outputs
-		ctx.Export("controlPlaneVIP", pulumi.String(vip.IPAddress))
+		ctx.Export("controlPlaneVIP", pulumi.String(cfg.K8sVIP))
+		ctx.Export("kubeconfig", cluster.KubeConfig)
+
+		// ✅ Export node IPs untuk debugging
+		for i, node := range nodes {
+			ctx.Export(fmt.Sprintf("node%d_ip", i), node.IPAddress)
+		}
 
 		return nil
 	})
