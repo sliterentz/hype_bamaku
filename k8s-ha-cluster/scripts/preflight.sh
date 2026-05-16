@@ -55,7 +55,7 @@ echo "   Mem: ${MEM_MB} MiB"
 echo "   Disk free (/): ${DISK_GB} GiB"
 [ "${CPU}" -ge 2 ] || fail "CPU < 2 cores"
 [ "${MEM_MB}" -ge 2048 ] || fail "Memory < 2GiB"
-[ "${DISK_GB}" -ge 5 ] || fail "Disk free < 5GiB"
+[ "${DISK_GB}" -ge 20 ] || fail "Disk free < 5GiB"
 
 echo "🧩 Kernel modules"
 MODS="br_netfilter ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack"

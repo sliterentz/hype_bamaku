@@ -97,7 +97,7 @@ func Bootstrap(ctx *pulumi.Context, cfg *config.Config, nodes []*hyperv.Node) (*
 
                 echo "🔎 Pre-flight checks on $(hostname)"
 
-                echo "� Sudo (non-interactive)"
+                echo "Sudo (non-interactive)"
                 if ! sudo -n true 2>/dev/null; then
                     echo "❌ Passwordless sudo is required for bootstrap/preflight"
                     echo "   Fix: ensure SSH user has NOPASSWD sudo (e.g. /etc/sudoers.d/99-bootstrap-user)"
@@ -119,7 +119,7 @@ net.ipv4.ip_forward = 1
 EOF
                 sudo -n sysctl --system >/dev/null
 
-                echo "� Container runtime"
+                echo "Container runtime"
                 if ! sudo -n systemctl is-active --quiet containerd; then
                     echo "❌ containerd is not active"
                     exit 1
@@ -158,7 +158,7 @@ EOF
                 echo "   Disk free (/): ${DISK_GB} GiB"
                 if [ "${CPU}" -lt 2 ]; then echo "❌ CPU < 2 cores"; exit 1; fi
                 if [ "${MEM_MB}" -lt 2048 ]; then echo "❌ Memory < 2GiB"; exit 1; fi
-                if [ "${DISK_GB}" -lt 5 ]; then echo "❌ Disk free < 5GiB"; exit 1; fi
+                if [ "${DISK_GB}" -lt 20 ]; then echo "❌ Disk free < 5GiB"; exit 1; fi
 
                 echo "🧩 Kernel modules"
                 MODS="br_netfilter ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack"
@@ -461,14 +461,51 @@ EOF
 			sudo -n ctr tasks kill kube-vip 2>/dev/null || true
 
 			echo "🧾 Generating kube-vip manifest (static pod)"
-			sudo -n ctr run --rm --net-host "ghcr.io/kube-vip/kube-vip:$KVVERSION" kube-vip \
-				/kube-vip manifest pod \
-				--interface "$IFACE" \
-				--address "$VIP" \
-				--controlplane \
-				--services \
-				--arp \
-				--leaderElection | sudo -n tee /etc/kubernetes/manifests/kube-vip.yaml >/dev/null
+			LOCKFILE="/etc/kubernetes/manifests/.pulumi-manifests.lock"
+			sudo -n touch "$LOCKFILE"
+			TMP_MANIFEST="/tmp/kube-vip.yaml.$$"
+			
+			if command -v flock >/dev/null 2>&1; then
+				sudo -n flock -x "$LOCKFILE" bash -c '
+					set -Eeuo pipefail
+					TMP_MANIFEST="/tmp/kube-vip.yaml.$$"
+					ctr run --rm --net-host "ghcr.io/kube-vip/kube-vip:'"$KVVERSION"'" kube-vip \
+						/kube-vip manifest pod \
+						--interface "'"$IFACE"'" \
+						--address "'"$VIP"'" \
+						--controlplane \
+						--services \
+						--arp \
+						--leaderElection > "$TMP_MANIFEST"
+					if [ ! -s "$TMP_MANIFEST" ]; then
+						echo "❌ Generated manifest is empty" >&2
+						exit 1
+					fi
+					install -m 0644 "$TMP_MANIFEST" /etc/kubernetes/manifests/kube-vip.yaml.tmp
+					mv -f /etc/kubernetes/manifests/kube-vip.yaml.tmp /etc/kubernetes/manifests/kube-vip.yaml
+					chown root:root /etc/kubernetes/manifests/kube-vip.yaml
+					rm -f "$TMP_MANIFEST"
+					sync || true
+				'
+			else
+				sudo -n ctr run --rm --net-host "ghcr.io/kube-vip/kube-vip:$KVVERSION" kube-vip \
+					/kube-vip manifest pod \
+					--interface "$IFACE" \
+					--address "$VIP" \
+					--controlplane \
+					--services \
+					--arp \
+					--leaderElection > "$TMP_MANIFEST"
+				if [ ! -s "$TMP_MANIFEST" ]; then
+					echo "❌ Generated manifest is empty"
+					exit 1
+				fi
+				sudo -n install -m 0644 "$TMP_MANIFEST" /etc/kubernetes/manifests/kube-vip.yaml.tmp
+				sudo -n mv -f /etc/kubernetes/manifests/kube-vip.yaml.tmp /etc/kubernetes/manifests/kube-vip.yaml
+				sudo -n chown root:root /etc/kubernetes/manifests/kube-vip.yaml
+				rm -f "$TMP_MANIFEST"
+				sudo -n sync || true
+			fi
 
             echo "⏳ Waiting for kube-vip to initialize..."
             sleep 15
@@ -876,27 +913,26 @@ EOF
 		readManifestCmd, err := remote.NewCommand(ctx, readManifestName, &remote.CommandArgs{
 			Connection: conn0, // ✅ Baca dari primary node
 			Create: pulumi.String(`
-                set -e
+				set -Eeuo pipefail
 
-                echo "🔄 Updating kubeadm-config ConfigMap..."
-                kubectl -n kube-system get configmap kubeadm-config -o yaml | \
-                sed "s|controlPlaneEndpoint:.*|controlPlaneEndpoint: %s:6443|g" | \
-                kubectl apply -f -
-                
-                echo "📖 Reading kube-vip manifest from primary node..."
-                
-                # ✅ PERBAIKAN: Baca dari file yang sudah disimpan
-                if [ ! sudo ls -f /tmp/kube-vip-manifest.yaml ]; then
-                    echo "❌ kube-vip manifest not found at /tmp/kube-vip-manifest.yaml!"
-                    echo "📋 Trying fallback location..."
-                    if [ ! sudo ls -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
-                        echo "❌ kube-vip manifest not found on primary node!"
-                        exit 1
-                    fi
-                    sudo cat /etc/kubernetes/manifests/kube-vip.yaml
-                else
-                    sudo cat /tmp/kube-vip-manifest.yaml
-                fi
+				echo "🔄 Updating kubeadm-config ConfigMap..." >&2
+				{ kubectl -n kube-system get configmap kubeadm-config -o yaml | \
+					sed "s|controlPlaneEndpoint:.*|controlPlaneEndpoint: %s:6443|g" | \
+					kubectl apply -f -; } 1>&2
+
+				echo "📖 Reading kube-vip manifest from primary node..." >&2
+
+				if [ -f /tmp/kube-vip-manifest.yaml ]; then
+					sudo cat /tmp/kube-vip-manifest.yaml
+					exit 0
+				fi
+
+				echo "⚠️  kube-vip manifest not found at /tmp/kube-vip-manifest.yaml, trying fallback..." >&2
+				if [ ! -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+					echo "❌ kube-vip manifest not found on primary node!" >&2
+					exit 1
+				fi
+				sudo cat /etc/kubernetes/manifests/kube-vip.yaml
             `),
 		}, pulumi.DependsOn([]pulumi.Resource{vipCmd, cniCmd}))
 
@@ -911,60 +947,116 @@ EOF
 		writeManifestCmd, err := remote.NewCommand(ctx, writeManifestName, &remote.CommandArgs{
 			Connection: conn1, // ✅ Write ke secondary node
 			Create: pulumi.Sprintf(`
-                set -e
+				set -Eeuo pipefail
                 
-                echo "📦 Copying kube-vip manifest from primary node..."
+                echo "📦 Preparing kube-vip manifest on node %s..."
                 
-                # ✅ Create temporary directory
+                # ✅ PERBAIKAN CRITICAL: Buat directory structure SEBELUM copy
+                echo "📁 Creating Kubernetes directory structure..."
+                sudo mkdir -p /etc/kubernetes/manifests
+				sudo mkdir -p /etc/kubernetes/kube-vip
+                sudo mkdir -p /etc/kubernetes/pki
                 sudo mkdir -p /tmp/kube-vip-setup
+                
+                # ✅ Set proper permissions
+                sudo chmod 755 /etc/kubernetes
+                sudo chmod 755 /etc/kubernetes/manifests
+                sudo chmod 755 /etc/kubernetes/kube-vip
+                sudo chown -R root:root /etc/kubernetes
+                
+                # ✅ Verify directory creation
+                if [ ! -d /etc/kubernetes/manifests ]; then
+                    echo "❌ Failed to create /etc/kubernetes/manifests directory!"
+                    exit 1
+                fi
+                
+                echo "✅ Directory structure created:"
+                sudo ls -la /etc/kubernetes/
                 
                 # ✅ Write manifest content menggunakan heredoc
                 cat <<'MANIFEST_EOF' | sudo tee /tmp/kube-vip-setup/kube-vip.yaml > /dev/null
 %s
 MANIFEST_EOF
-                
-                # ✅ Verify copied file
+
+                # ✅ Verify copied file exists
                 if [ ! -f /tmp/kube-vip-setup/kube-vip.yaml ]; then
-                    echo "❌ Manifest file not found after copy!"
+                    echo "❌ Manifest file not found after write!"
                     exit 1
                 fi
                 
                 # ✅ Verify file is not empty
-                if [ ! -s /tmp/kube-vip-setup/kube-vip.yaml ]; then
+                FILE_SIZE=$(sudo wc -c < /tmp/kube-vip-setup/kube-vip.yaml)
+                if [ "$FILE_SIZE" -eq 0 ]; then
                     echo "❌ Manifest file is empty!"
                     exit 1
                 fi
                 
-                echo "🔍 Manifest preview:"
-                head -n 5 /tmp/kube-vip-setup/kube-vip.yaml
+                echo "✅ Manifest file created (size: ${FILE_SIZE} bytes)"
                 
-                # ✅ Create manifests directory if not exists
-                sudo mkdir -p /etc/kubernetes/manifests
+                # ✅ Validate YAML syntax
+                echo "🔍 Validating YAML syntax..."
+                if command -v yamllint >/dev/null 2>&1; then
+                    yamllint /tmp/kube-vip-setup/kube-vip.yaml || echo "⚠️  YAML validation warning (non-critical)"
+                fi
                 
-                # ✅ Move manifest to final location
-                sudo cp /tmp/kube-vip-setup/kube-vip.yaml /etc/kubernetes/manifests/kube-vip.yaml
+                # ✅ Verify manifest contains required fields
+                if ! grep -q "kind: Pod" /tmp/kube-vip-setup/kube-vip.yaml; then
+                    echo "❌ Manifest missing 'kind: Pod' field!"
+                    cat /tmp/kube-vip-setup/kube-vip.yaml
+                    exit 1
+                fi
                 
-                # ✅ Set proper permissions
-                sudo chmod 644 /etc/kubernetes/manifests/kube-vip.yaml
-                sudo chown root:root /etc/kubernetes/manifests/kube-vip.yaml
+                if ! grep -q "name: kube-vip" /tmp/kube-vip-setup/kube-vip.yaml; then
+                    echo "❌ Manifest missing 'name: kube-vip' field!"
+                    exit 1
+                fi                
+
+                echo "✅ Manifest validation passed"
+
+                # ✅ Show manifest preview
+                echo "🔍 Manifest preview (first 15 lines):"
+                head -n 15 /tmp/kube-vip-setup/kube-vip.yaml
+                
+				echo "📦 Staging manifest to /etc/kubernetes/kube-vip/kube-vip.yaml (activate after join)..."
+				LOCKFILE="/etc/kubernetes/kube-vip/.pulumi-kubevip.lock"
+				sudo touch "$LOCKFILE"
+				if command -v flock >/dev/null 2>&1; then
+					sudo flock -x "$LOCKFILE" bash -c 'set -Eeuo pipefail; install -m 0644 /tmp/kube-vip-setup/kube-vip.yaml /etc/kubernetes/kube-vip/kube-vip.yaml.tmp; mv -f /etc/kubernetes/kube-vip/kube-vip.yaml.tmp /etc/kubernetes/kube-vip/kube-vip.yaml; chown root:root /etc/kubernetes/kube-vip/kube-vip.yaml; sync || true'
+				else
+					sudo install -m 0644 /tmp/kube-vip-setup/kube-vip.yaml /etc/kubernetes/kube-vip/kube-vip.yaml.tmp
+					sudo mv -f /etc/kubernetes/kube-vip/kube-vip.yaml.tmp /etc/kubernetes/kube-vip/kube-vip.yaml
+					sudo chown root:root /etc/kubernetes/kube-vip/kube-vip.yaml
+					sudo sync || true
+				fi
+				
+				if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+					echo "⚠️  Found active kube-vip manifest, moving to staging to avoid VIP takeover during join..."
+					sudo mv -f /etc/kubernetes/manifests/kube-vip.yaml /etc/kubernetes/kube-vip/kube-vip.yaml || true
+				fi
+
+				# ✅ Verify staging
+				echo "🔍 Verifying staged manifest..."
+				if [ ! -f /etc/kubernetes/kube-vip/kube-vip.yaml ]; then
+					echo "❌ Manifest staging verification failed!"
+					sudo ls -la /etc/kubernetes/kube-vip/ || true
+					exit 1
+				fi
+				
+				echo "✅ Manifest staged successfully:"
+				sudo ls -lh /etc/kubernetes/kube-vip/kube-vip.yaml
                 
                 # ✅ Cleanup temp directory
                 sudo rm -rf /tmp/kube-vip-setup
                 
-                # ✅ Verify final installation
-                echo "🔍 Verifying manifest installation..."
-                if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
-                    sudo ls -lh /etc/kubernetes/manifests/kube-vip.yaml
-                    echo "✅ kube-vip manifest installed successfully on node %s"
-                else
-                    echo "❌ Manifest installation verification failed!"
-                    exit 1
-                fi
-                
-                # ✅ Wait for kubelet to detect the manifest
-                echo "⏳ Waiting for kubelet to detect manifest..."
-                sleep 10
+                # ✅ IMPORTANT: Prevent kubelet from starting prematurely
+                echo "🛑 Disabling kubelet service (will be enabled during join)..."
+                sudo systemctl stop kubelet 2>/dev/null || true
+                sudo systemctl disable kubelet 2>/dev/null || true
+
+                echo "✅ kube-vip manifest preparation complete on node %s"
+				echo "✅ kube-vip manifest staged (will be activated post-join)"
             `,
+				nodes[i].Name,          // Display node name (first occurrence)
 				readManifestCmd.Stdout, // Inject content from primary node
 				nodes[i].Name),         // Display node name
 		}, pulumi.DependsOn([]pulumi.Resource{readManifestCmd, vipReachabilityCommands[i]}))
@@ -1014,6 +1106,7 @@ KUBECONFIG_EOF
 	}
 
 	// Join node ke cluster (setelah manifest kube-vip di-copy)
+	var previousJoin pulumi.Resource
 	for i := 1; i < len(nodes); i++ {
 		conn1 := createConnection(nodes[i])
 
@@ -1024,6 +1117,10 @@ KUBECONFIG_EOF
 
 		// Step 3: Baca join command dari primary node (node 0)
 		readJoinCmdName := fmt.Sprintf("read-join-cmd-%d", i)
+		readJoinDeps := []pulumi.Resource{joinCmd, copyVipDep}
+		if previousJoin != nil {
+			readJoinDeps = append(readJoinDeps, previousJoin)
+		}
 		readJoinCmd, err := remote.NewCommand(ctx, readJoinCmdName, &remote.CommandArgs{
 			Connection: conn0, // ✅ Baca dari primary node
 			Create: pulumi.String(`
@@ -1034,10 +1131,203 @@ KUBECONFIG_EOF
                 fi
                 sudo cat /tmp/k8s-join-command.txt
             `),
-		}, pulumi.DependsOn([]pulumi.Resource{joinCmd, copyVipDep}))
+		}, pulumi.DependsOn(readJoinDeps))
 
 		if err != nil {
 			return nil, fmt.Errorf("gagal read join command: %w", err)
+		}
+
+		// ✅ CRITICAL: Enhanced etcd health check dengan sync verification
+		etcdHealthCheckName := fmt.Sprintf("etcd-health-check-%d", i)
+		etcdHealthCheck, err := remote.NewCommand(ctx, etcdHealthCheckName, &remote.CommandArgs{
+			Connection: conn0,
+			Create: pulumi.Sprintf(`
+                set -Eeuo pipefail
+                
+                echo "🔍 Enhanced etcd cluster health check before joining node %d..."
+                
+                # ✅ PERBAIKAN 1: Verify etcd cluster is stable
+                MAX_ETCD_WAIT=120  # Increased timeout
+                ETCD_COUNT=0
+                
+                while [ $ETCD_COUNT -lt $MAX_ETCD_WAIT ]; do
+                    # Check etcd member list
+                    if MEMBER_LIST=$(sudo ETCDCTL_API=3 etcdctl \
+                        --endpoints=https://127.0.0.1:2379 \
+                        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                        --cert=/etc/kubernetes/pki/etcd/server.crt \
+                        --key=/etc/kubernetes/pki/etcd/server.key \
+                        member list 2>/dev/null); then
+                        
+                        echo "📋 Current etcd members:"
+                        echo "$MEMBER_LIST"
+                        
+                        # Check etcd endpoint health
+                        if HEALTH_OUTPUT=$(sudo ETCDCTL_API=3 etcdctl \
+                            --endpoints=https://127.0.0.1:2379 \
+                            --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                            --cert=/etc/kubernetes/pki/etcd/server.crt \
+                            --key=/etc/kubernetes/pki/etcd/server.key \
+                            endpoint health 2>&1); then
+                            
+                            echo "✅ etcd endpoint health check passed"
+                            echo "$HEALTH_OUTPUT"
+                            
+                            # ✅ PERBAIKAN 2: Verify etcd cluster status
+                            if CLUSTER_STATUS=$(sudo ETCDCTL_API=3 etcdctl \
+                                --endpoints=https://127.0.0.1:2379 \
+                                --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                                --cert=/etc/kubernetes/pki/etcd/server.crt \
+                                --key=/etc/kubernetes/pki/etcd/server.key \
+                                endpoint status -w table 2>/dev/null); then
+                                
+                                echo "📊 etcd cluster status:"
+                                echo "$CLUSTER_STATUS"
+                                
+                                # ✅ PERBAIKAN 3: Check for learner members
+                                LEARNER_COUNT=$(echo "$MEMBER_LIST" | grep -c "isLearner=true" || echo "0")
+                                
+                                if [ "$LEARNER_COUNT" -gt 0 ]; then
+                                    echo "⚠️  Found $LEARNER_COUNT learner member(s), waiting for promotion..."
+                                    ETCD_COUNT=$((ETCD_COUNT + 1))
+                                    sleep 5
+                                    continue
+                                fi
+                                
+                                # ✅ PERBAIKAN 4: Verify all members are started
+                                STARTED_COUNT=$(echo "$MEMBER_LIST" | grep -c "started" || echo "0")
+                                TOTAL_COUNT=$(echo "$MEMBER_LIST" | wc -l)
+                                
+                                if [ "$STARTED_COUNT" -ne "$TOTAL_COUNT" ]; then
+                                    echo "⚠️  Not all members started ($STARTED_COUNT/$TOTAL_COUNT)"
+                                    ETCD_COUNT=$((ETCD_COUNT + 1))
+                                    sleep 5
+                                    continue
+                                fi
+                                
+                                echo "✅ All etcd members are started and healthy"
+                                break
+                            fi
+                        fi
+                    fi
+                    
+                    ETCD_COUNT=$((ETCD_COUNT + 1))
+                    echo "   Attempt $ETCD_COUNT/$MAX_ETCD_WAIT: Waiting for etcd cluster stability..."
+                    sleep 5
+                done
+                
+                if [ $ETCD_COUNT -eq $MAX_ETCD_WAIT ]; then
+                    echo "❌ etcd cluster not stable after $MAX_ETCD_WAIT attempts"
+                    echo "📋 Final member list:"
+                    sudo ETCDCTL_API=3 etcdctl \
+                        --endpoints=https://127.0.0.1:2379 \
+                        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                        --cert=/etc/kubernetes/pki/etcd/server.crt \
+                        --key=/etc/kubernetes/pki/etcd/server.key \
+                        member list || true
+                    exit 1
+                fi
+                
+                # ✅ PERBAIKAN 5: Additional stability wait
+                echo "⏳ Waiting 30s for etcd cluster full stabilization..."
+                sleep 30
+                
+                # ✅ PERBAIKAN 6: Final verification
+                echo "🔍 Final etcd verification..."
+                sudo ETCDCTL_API=3 etcdctl \
+                    --endpoints=https://127.0.0.1:2379 \
+                    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                    --cert=/etc/kubernetes/pki/etcd/server.crt \
+                    --key=/etc/kubernetes/pki/etcd/server.key \
+                    endpoint status -w table
+                
+                echo "✅ etcd cluster ready for new member"
+            `, i),
+		}, pulumi.DependsOn([]pulumi.Resource{readJoinCmd}))
+
+		if err != nil {
+			return nil, fmt.Errorf("gagal check etcd health: %w", err)
+		}
+
+		// ✅ PERBAIKAN: Tambahkan explicit wait untuk kube-vip manifest
+		waitVipManifest, err := remote.NewCommand(ctx, fmt.Sprintf("wait-vip-manifest-%d", i), &remote.CommandArgs{
+			Connection: conn1,
+			Create: pulumi.String(`
+                set -Eeuo pipefail
+                
+                echo "⏳ Waiting for staged kube-vip manifest..."
+                
+                MAX_WAIT=60
+                WAIT_COUNT=0
+                
+                while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
+                    # ✅ Check 1: Directory exists
+                    if [ ! -d /etc/kubernetes/kube-vip ]; then
+                        echo "⚠️  Directory /etc/kubernetes/kube-vip not found (attempt $((WAIT_COUNT+1))/$MAX_WAIT)"
+                        WAIT_COUNT=$((WAIT_COUNT + 1))
+                        sleep 2
+                        continue
+                    fi
+                    
+                    # ✅ Check 2: Staged file exists
+                    if [ ! -f /etc/kubernetes/kube-vip/kube-vip.yaml ]; then
+                        echo "⚠️  Staged manifest file not found (attempt $((WAIT_COUNT+1))/$MAX_WAIT)"
+                        echo "📋 Directory contents:"
+                        sudo ls -la /etc/kubernetes/kube-vip/ 2>/dev/null || echo "Cannot list directory"
+                        WAIT_COUNT=$((WAIT_COUNT + 1))
+                        sleep 2
+                        continue
+                    fi
+                    
+                    # ✅ Check 3: File is not empty
+                    FILE_SIZE=$(sudo wc -c < /etc/kubernetes/kube-vip/kube-vip.yaml 2>/dev/null || echo "0")
+                    if [ "$FILE_SIZE" -eq 0 ]; then
+                        echo "⚠️  Manifest file is empty (attempt $((WAIT_COUNT+1))/$MAX_WAIT)"
+                        WAIT_COUNT=$((WAIT_COUNT + 1))
+                        sleep 2
+                        continue
+                    fi
+                    
+                    # ✅ Check 4: File is valid YAML with required fields
+                    if ! sudo cat /etc/kubernetes/kube-vip/kube-vip.yaml | grep -q "kind: Pod"; then
+                        echo "⚠️  Manifest missing 'kind: Pod' (attempt $((WAIT_COUNT+1))/$MAX_WAIT)"
+                        WAIT_COUNT=$((WAIT_COUNT + 1))
+                        sleep 2
+                        continue
+                    fi
+                    
+                    # ✅ All checks passed
+                    echo "✅ kube-vip manifest verification complete"
+                    echo "📋 Manifest details:"
+                    echo "   Path: /etc/kubernetes/kube-vip/kube-vip.yaml"
+                    echo "   Size: ${FILE_SIZE} bytes"
+                    echo "   Permissions: $(sudo stat -c '%a' /etc/kubernetes/kube-vip/kube-vip.yaml)"
+                    echo "   Owner: $(sudo stat -c '%U:%G' /etc/kubernetes/kube-vip/kube-vip.yaml)"
+                    
+                    # ✅ Show manifest preview
+                    echo "📋 Manifest preview (first 10 lines):"
+                    sudo head -n 10 /etc/kubernetes/kube-vip/kube-vip.yaml
+                    
+                    break
+                done
+                    
+                if [ $WAIT_COUNT -eq $MAX_WAIT ]; then
+                    echo "❌ kube-vip manifest verification failed after ${MAX_WAIT} attempts"
+                    echo "📋 Final directory check:"
+                    sudo ls -laR /etc/kubernetes/ 2>/dev/null || echo "Cannot access /etc/kubernetes/"
+                    exit 1
+                fi
+                
+                # ✅ Additional stability wait
+                echo "⏳ Waiting 5s for filesystem sync..."
+                sleep 5
+                
+                echo "✅ kube-vip manifest ready for join operation"
+            `),
+		}, pulumi.DependsOn([]pulumi.Resource{copyVipDep}))
+
+		if err != nil {
+			return nil, fmt.Errorf("gagal wait vip manifest node %d: %w", i, err)
 		}
 
 		// Join node ke cluster dan copy kube-vip manifest dari node pertama ke node lainnya
@@ -1050,9 +1340,94 @@ KUBECONFIG_EOF
 				trap 'rc=$?; echo "❌ ${STEP} failed (rc=$rc)"; echo "📋 routes:"; ip -4 route || true; echo "📋 neigh:"; ip neigh show || true; echo "📋 kubelet:"; sudo journalctl -u kubelet -n 80 --no-pager || true; exit $rc' ERR
 
 				VIP="%s"
+				NODE_NAME="%s"
+				ENDPOINT="%s"
+				IFACE="%s"
 
-                echo "🚀 Joining node %s to cluster..."
-                echo "   Using endpoint: %s:6443"
+				echo "🚀 Joining node $NODE_NAME to cluster..."
+				echo "   Using endpoint: $ENDPOINT:6443"
+				echo "   Using interface: $IFACE"
+				
+				echo "🏷️  Ensuring hostname matches expected node name..."
+				sudo hostnamectl set-hostname "$NODE_NAME" || true
+				CURRENT_HOST_FQDN=$(hostname -f 2>/dev/null || hostname)
+				echo "📋 Current hostname: $CURRENT_HOST_FQDN"
+				
+				echo "🧭 Verifying endpoint DNS resolution..."
+				RESOLVED_IP=""
+				if command -v getent >/dev/null 2>&1; then
+					RESOLVED_IP=$(getent ahostsv4 "$ENDPOINT" | awk '{print $1; exit}' || true)
+				elif command -v nslookup >/dev/null 2>&1; then
+					RESOLVED_IP=$(nslookup "$ENDPOINT" 2>/dev/null | awk '/^Address: /{print $2; exit}' || true)
+				fi
+				echo "📋 $ENDPOINT resolves to: ${RESOLVED_IP:-<unknown>}"
+				
+				NODE_IP=""
+				NODE_IP=$(ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
+				echo "🔍 Node IP on $IFACE: ${NODE_IP:-<unknown>}"
+				
+				if [ -n "$NODE_IP" ] && [ "$NODE_IP" = "$VIP" ]; then
+					echo "❌ Invalid configuration: node IP equals VIP ($VIP). Choose a VIP not used by any node."
+					exit 1
+				fi
+				
+				if [ -n "$RESOLVED_IP" ] && [ -n "$NODE_IP" ] && [ "$RESOLVED_IP" = "$NODE_IP" ]; then
+					echo "❌ Endpoint $ENDPOINT resolves to this node's IP ($NODE_IP). This will break join (self-target)."
+					echo "   Fix DNS A record or use /etc/hosts mapping to VIP ($VIP)."
+					exit 1
+				fi
+				
+				echo "🧾 Ensuring /etc/hosts maps endpoint to VIP (defensive against DNS issues)..."
+				if ! grep -qE "^[[:space:]]*${VIP}[[:space:]]+${ENDPOINT}([[:space:]]+|$)" /etc/hosts; then
+					echo "${VIP} ${ENDPOINT}" | sudo tee -a /etc/hosts >/dev/null
+				fi
+				
+				echo "🧹 Ensuring kube-vip manifest is staged (not active) before join..."
+				sudo mkdir -p /etc/kubernetes/kube-vip
+				if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+					echo "⚠️  Active kube-vip manifest found, moving to staging to avoid VIP takeover during join"
+					sudo mv -f /etc/kubernetes/manifests/kube-vip.yaml /etc/kubernetes/kube-vip/kube-vip.yaml || true
+				fi
+				if [ ! -f /etc/kubernetes/kube-vip/kube-vip.yaml ]; then
+					echo "❌ Staged kube-vip manifest not found at /etc/kubernetes/kube-vip/kube-vip.yaml"
+					sudo ls -la /etc/kubernetes/kube-vip/ || true
+					exit 1
+				fi
+                
+                echo "🔍 Pre-join verification for node $NODE_NAME..."
+                
+                # ✅ CRITICAL: Verify directory structure EXISTS
+                echo "📁 Verifying Kubernetes directory structure..."
+                
+                REQUIRED_DIRS=(
+                    "/etc/kubernetes"
+                    "/etc/kubernetes/manifests"
+					"/etc/kubernetes/kube-vip"
+                    "/etc/kubernetes/pki"
+                    "/var/lib/kubelet"
+                )
+
+                for dir in "${REQUIRED_DIRS[@]}"; do
+                    if [ ! -d "$dir" ]; then
+                        echo "⚠️  Creating missing directory: $dir"
+                        sudo mkdir -p "$dir"
+                        sudo chmod 755 "$dir"
+                        sudo chown root:root "$dir"
+                    fi
+                    echo "✅ Directory exists: $dir"
+                done
+
+                # ✅ PERBAIKAN 0: Stop kubelet dulu untuk mencegah premature start
+                echo "🛑 Stopping kubelet service..."
+                sudo systemctl stop kubelet || true
+                sudo systemctl disable kubelet || true
+
+                # ✅ Clean up previous kubelet state SEBELUM join
+                echo "🧹 Cleaning up previous kubelet state..."
+                sudo rm -rf /var/lib/kubelet/* || true
+                sudo rm -rf /etc/kubernetes/kubelet.conf || true
+                sudo rm -rf /etc/kubernetes/pki/ca.crt || true
+                sudo rm -rf /etc/kubernetes/bootstrap-kubelet.conf || true
                 
                 # ✅ PERBAIKAN: Inject join command langsung dari Pulumi Output
                 JOIN_CMD='%s'
@@ -1102,7 +1477,7 @@ KUBECONFIG_EOF
                 API_COUNT=0
                 
                 while [ $API_COUNT -lt $MAX_API_RETRIES ]; do
-					if curl -kfsS --connect-timeout 2 --max-time 4 https://%s:6443/healthz &>/dev/null; then
+					if curl -kfsS --connect-timeout 2 --max-time 4 https://$ENDPOINT:6443/healthz &>/dev/null; then
                         echo "✅ API server is responding"
                         break
                     fi
@@ -1110,6 +1485,7 @@ KUBECONFIG_EOF
                     echo "   Attempt $API_COUNT/$MAX_API_RETRIES: Waiting for API server..."
                     sleep 5
                 done
+
 				if [ $API_COUNT -eq $MAX_API_RETRIES ]; then
 					echo "❌ API server not reachable via endpoint"
 					echo "📋 testing VIP healthz directly: https://$VIP:6443/healthz"
@@ -1117,210 +1493,360 @@ KUBECONFIG_EOF
 					exit 1
 				fi
     
-                # ✅ PERBAIKAN 2: Verifikasi kube-vip manifest
-                echo "🔍 Verifying kube-vip manifest..."
-                if [ ! -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
-                    echo "❌ kube-vip manifest not found!"
-                    echo "📋 Listing /etc/kubernetes/manifests:"
-                    sudo ls -la /etc/kubernetes/manifests/ || echo "Directory not found"
+                # ✅ PERBAIKAN 2: Verifikasi staged kube-vip manifest (belum aktif)
+                echo "🔍 Verifying staged kube-vip manifest..."
+                if [ ! -f /etc/kubernetes/kube-vip/kube-vip.yaml ]; then
+                    echo "❌ staged kube-vip manifest not found!"
+                    echo "📋 Listing /etc/kubernetes/kube-vip:"
+                    sudo ls -la /etc/kubernetes/kube-vip/ || echo "Directory not found"
                     exit 1
                 fi
                 
-                echo "✅ kube-vip manifest found"
+                echo "✅ staged kube-vip manifest found"
+                
                 echo "📋 Manifest preview:"
-                sudo head -n 10 /etc/kubernetes/manifests/kube-vip.yaml
-    
-                # ✅ PERBAIKAN 3: Jalankan join command
-                echo "📝 Executing join command..."
-                echo "   Command preview: sudo kubeadm join %s:6443 ..."
-                
-                # Execute join dengan error handling
-                
-                # 🛠 FIX: Ensure containerd uses systemd cgroup on join node
+                sudo head -n 10 /etc/kubernetes/kube-vip/kube-vip.yaml
+
+                # ✅ PERBAIKAN 3: Configure containerd SEBELUM join
                 echo "🔧 Configuring containerd systemd cgroup..."
                 sudo mkdir -p /etc/containerd
                 sudo containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
                 sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
                 sudo systemctl restart containerd
+                sudo systemctl enable containerd
+
+                # Verify containerd is running
+                if ! sudo systemctl is-active --quiet containerd; then
+                    echo "❌ containerd failed to start!"
+                    sudo systemctl status containerd --no-pager
+                    exit 1
+                fi
+                echo "✅ containerd configured and running"
                 
-                # 🛠 FIX: Disable swap on join node
+                # Execute join dengan error handling
+                
+                # ✅ Disable swap on join node
                 echo "🔧 Disabling swap..."
                 sudo swapoff -a
                 sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
-                # 🛠 FIX: Ensure hostname is mapped in /etc/hosts
+                # ✅ Ensure hostname mapping
                 if ! grep -q "$(hostname)" /etc/hosts; then
                     echo "127.0.1.1 $(hostname)" | sudo tee -a /etc/hosts
                 fi
 
-                if sudo eval "$JOIN_CMD"; then
-                    echo "✅ Join command executed successfully"
+                # ✅ CRITICAL FIX: Setup kubeconfig SEBELUM join
+                echo "⚙️  Pre-configuring kubeconfig directory..."
+                mkdir -p $HOME/.kube
+                
+                # Copy kubeconfig yang sudah di-update dari primary node
+                if [ -f $HOME/.kube/config ]; then
+                    echo "✅ Using pre-copied kubeconfig from primary node"
+                    export KUBECONFIG=$HOME/.kube/config
+                    
+                    # Verify kubeconfig points to VIP/domain
+                    CURRENT_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")
+                    echo "📋 Current kubeconfig server: $CURRENT_SERVER"
+                    
+                    if [[ "$CURRENT_SERVER" != *"$ENDPOINT"* ]]; then
+                        echo "⚠️  Kubeconfig not using VIP endpoint, will update after join"
+                    fi
                 else
-                    echo "❌ Join command failed!"
-                    echo "📋 Checking kubelet logs:"
+                    echo "⚠️  Pre-copied kubeconfig not found, will configure after join"
+                fi
+                
+                # ✅ PERBAIKAN 4: Jalankan join command
+                echo "🔗 Executing join command..."
+                
+                # ✅ Tambahkan flag --ignore-preflight-errors untuk bypass kubelet check
+                JOIN_CMD_MODIFIED="${JOIN_CMD} --ignore-preflight-errors=DirAvailable--var-lib-etcd,FileAvailable--etc-kubernetes-kubelet.conf"
+                
+				# Execute join dengan retry khusus untuk error promote learner yang prematur
+				MAX_JOIN_ATTEMPTS=5
+				JOIN_ATTEMPT=1
+				while [ $JOIN_ATTEMPT -le $MAX_JOIN_ATTEMPTS ]; do
+					echo "🔁 Join attempt $JOIN_ATTEMPT/$MAX_JOIN_ATTEMPTS"
+					set +e
+					JOIN_OUTPUT=$(eval "$JOIN_CMD_MODIFIED" 2>&1)
+					JOIN_RC=$?
+					set -e
+					if [ $JOIN_RC -eq 0 ]; then
+						break
+					fi
+					
+					if echo "$JOIN_OUTPUT" | grep -q "etcdserver: can only promote a learner member which is in sync with leader"; then
+						echo "⚠️  etcd learner belum in-sync dengan leader; menunggu stabilisasi lalu retry..."
+						sleep 45
+						JOIN_ATTEMPT=$((JOIN_ATTEMPT + 1))
+						continue
+					fi
+					
+					echo "❌ Join command failed (rc=$JOIN_RC)!"
+					echo "📋 kubeadm output (tail):"
+					echo "$JOIN_OUTPUT" | tail -n 80
+					echo "📋 Checking kubelet logs:"
+					sudo journalctl -u kubelet -n 80 --no-pager || true
+					exit 1
+				done
+				
+				if [ $JOIN_RC -ne 0 ]; then
+					echo "❌ Join command still failing after $MAX_JOIN_ATTEMPTS attempts"
+					echo "📋 Last kubeadm output (tail):"
+					echo "$JOIN_OUTPUT" | tail -n 120
+					echo "📋 kubelet logs:"
+					sudo journalctl -u kubelet -n 120 --no-pager || true
+					exit 1
+				fi
+
+                echo "✅ Node joined successfully"
+
+                # ✅ PERBAIKAN 4: Update kubeconfig SEBELUM enable kubelet
+                echo "🔄 Updating kubeconfig to use VIP endpoint..."
+                
+                # ✅ Ensure .kube directory exists
+                echo "⚙️  Setting up kubeconfig..."
+                mkdir -p $HOME/.kube
+
+                # Update server endpoint in kubeconfig
+                if [ -f $HOME/.kube/config ]; then
+                    # Backup original config
+                    sudo cp $HOME/.kube/config $HOME/.kube/config.backup
+                    
+                    # Update server endpoint
+                    sudo sed -i "s|server:.*|server: https://${ENDPOINT}:6443|g" $HOME/.kube/config
+                    
+                    # Verify update
+                    CURRENT_SERVER=$(grep "server:" $HOME/.kube/config | head -1)
+                    echo "📋 Updated kubeconfig server: $CURRENT_SERVER"
+                    
+                    if ! echo "$CURRENT_SERVER" | grep -q "${ENDPOINT}:6443"; then
+                        echo "⚠️  Warning: kubeconfig update may have failed"
+                        echo "   Restoring backup..."
+                        sudo cp $HOME/.kube/config.backup $HOME/.kube/config
+                    else
+                        echo "✅ kubeconfig updated successfully"
+                    fi
+                fi
+    
+                # ✅ PERBAIKAN 5: Update kubeconfig SEBELUM enable service
+                echo "🔄 Updating kubeconfig to use VIP endpoint..."
+                
+                if [ -f /etc/kubernetes/kubelet.conf ]; then
+                    # Backup original kubelet.conf
+                    sudo cp /etc/kubernetes/kubelet.conf /etc/kubernetes/kubelet.conf.backup
+                    
+                    # Update server endpoint in kubelet.conf
+                    sudo sed -i "s|server:.*|server: https://${ENDPOINT}:6443|g" /etc/kubernetes/kubelet.conf
+                    
+                    # Verify update
+                    KUBELET_SERVER=$(sudo grep "server:" /etc/kubernetes/kubelet.conf | head -1)
+                    echo "📋 Updated kubelet.conf server: $KUBELET_SERVER"
+                    
+                    if ! echo "$KUBELET_SERVER" | grep -q "${ENDPOINT}:6443"; then
+                        echo "⚠️  Warning: kubelet.conf update may have failed"
+                        echo "   Restoring backup..."
+                        sudo cp /etc/kubernetes/kubelet.conf.backup /etc/kubernetes/kubelet.conf
+                    else
+                        echo "✅ kubelet.conf updated successfully"
+                    fi
+                else
+                    echo "⚠️  Warning: /etc/kubernetes/kubelet.conf not found"
+                fi
+                
+                # ✅ PERBAIKAN 7: Reload systemd dan restart kubelet
+                echo "🔄 Reloading systemd and restarting kubelet..."
+                sudo systemctl daemon-reload
+                
+                # Enable kubelet service
+                sudo systemctl enable kubelet
+                
+                # Restart kubelet dengan updated config
+                sudo systemctl restart kubelet
+                
+                # Wait for kubelet to stabilize
+                echo "⏳ Waiting for kubelet to stabilize..."
+                sleep 15
+                
+                # ✅ PERBAIKAN 8: Verify kubelet status
+                echo "🔍 Verifying kubelet status..."
+                
+                if ! sudo systemctl is-active --quiet kubelet; then
+                    echo "❌ kubelet is not active!"
+                    echo "📋 kubelet status:"
+                    sudo systemctl status kubelet --no-pager || true
+                    echo "📋 Recent kubelet logs:"
                     sudo journalctl -u kubelet -n 50 --no-pager || true
                     exit 1
                 fi
                 
-                # ✅ PERBAIKAN 4: Setup kubeconfig SEBELUM kubectl commands
-                echo "⚙️  Setting up kubeconfig..."
+                echo "✅ kubelet is active and running"
                 
-                # Create .kube directory
-                mkdir -p $HOME/.kube
+                # ✅ PERBAIKAN 9: Verify node registration
+                echo "🔍 Verifying node registration..."
                 
-                # Wait for admin.conf to be created
-                echo "⏳ Waiting for admin.conf..."
-                MAX_WAIT=30
-                WAIT_COUNT=0
+                MAX_NODE_WAIT=60
+                NODE_COUNT=0
                 
-                while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
-                    if [ -f /etc/kubernetes/admin.conf ]; then
-                        echo "✅ admin.conf found"
+                while [ $NODE_COUNT -lt $MAX_NODE_WAIT ]; do
+                    if kubectl get node $NODE_NAME &>/dev/null; then
+                        echo "✅ Node registered in cluster"
+                        
+                        # Show node info
+                        echo "📋 Node information:"
+                        kubectl get node $NODE_NAME -o wide
+                        
                         break
                     fi
-                    WAIT_COUNT=$((WAIT_COUNT + 1))
-                    echo "   Attempt $WAIT_COUNT/$MAX_WAIT: Waiting for admin.conf..."
-                    sleep 2
+                    
+                    NODE_COUNT=$((NODE_COUNT + 1))
+                    echo "   Attempt $NODE_COUNT/$MAX_NODE_WAIT: Waiting for node registration..."
+                    sleep 3
                 done
                 
-                if [ ! -f /etc/kubernetes/admin.conf ]; then
-                    echo "❌ admin.conf not found after join!"
+                if [ $NODE_COUNT -eq $MAX_NODE_WAIT ]; then
+                    echo "❌ Node not registered after $MAX_NODE_WAIT attempts"
+                    echo "📋 Cluster nodes:"
+                    kubectl get nodes || true
                     exit 1
                 fi
+
+				echo "🚦 Activating kube-vip manifest (post-join)..."
+				LOCKFILE="/etc/kubernetes/manifests/.pulumi-manifests.lock"
+				sudo touch "$LOCKFILE"
+				if command -v flock >/dev/null 2>&1; then
+					sudo flock -x "$LOCKFILE" bash -c 'set -Eeuo pipefail; install -m 0644 /etc/kubernetes/kube-vip/kube-vip.yaml /etc/kubernetes/manifests/kube-vip.yaml.tmp; mv -f /etc/kubernetes/manifests/kube-vip.yaml.tmp /etc/kubernetes/manifests/kube-vip.yaml; chown root:root /etc/kubernetes/manifests/kube-vip.yaml; sync || true'
+				else
+					sudo install -m 0644 /etc/kubernetes/kube-vip/kube-vip.yaml /etc/kubernetes/manifests/kube-vip.yaml.tmp
+					sudo mv -f /etc/kubernetes/manifests/kube-vip.yaml.tmp /etc/kubernetes/manifests/kube-vip.yaml
+					sudo chown root:root /etc/kubernetes/manifests/kube-vip.yaml
+					sudo sync || true
+				fi
+				echo "✅ kube-vip manifest activated"
                 
-                # Copy kubeconfig
-                sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
-                sudo chown $(id -u):$(id -g) $HOME/.kube/config
+                # ✅ PERBAIKAN 10: Verify kube-vip pod
+                echo "🔍 Verifying kube-vip pod..."
                 
-                # ✅ Set KUBECONFIG environment variable explicitly
-                export KUBECONFIG=$HOME/.kube/config
+                MAX_VIP_WAIT=60
+                VIP_COUNT=0
                 
-                # Verify kubeconfig is valid
-                echo "🔍 Verifying kubeconfig..."
-                if kubectl config view &>/dev/null; then
-                    echo "✅ Kubeconfig is valid"
-                else
-                    echo "❌ Kubeconfig is invalid!"
-                    cat $HOME/.kube/config
-                    exit 1
-                fi
-    
-                # ✅ PERBAIKAN 5: Update kubeconfig untuk menggunakan domain/VIP
-                echo "🔄 Updating kubeconfig to use domain endpoint..."
-                
-                # Show current server
-                CURRENT_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
-                echo "   Current server: $CURRENT_SERVER"
-                
-                # Update to domain endpoint
-                if kubectl config set-cluster kubernetes --server=https://%s:6443; then
-                    echo "✅ Kubeconfig updated to: https://%s:6443"
-                else
-                    echo "⚠️  Failed to update kubeconfig, but continuing..."
-                fi
-                
-                # Verify update
-                NEW_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
-                echo "   New server: $NEW_SERVER"
-    
-                # ✅ PERBAIKAN 6: Tunggu kube-vip pod aktif
-                echo "⏳ Waiting for kube-vip pod to start on this node..."
-                sleep 15
-                
-                # Wait for kubelet to be ready
-                echo "⏳ Waiting for kubelet to be ready..."
-                MAX_KUBELET_WAIT=30
-                KUBELET_COUNT=0
-                
-                while [ $KUBELET_COUNT -lt $MAX_KUBELET_WAIT ]; do
-                    if systemctl is-active --quiet kubelet; then
-                        echo "✅ Kubelet is active"
+                while [ $VIP_COUNT -lt $MAX_VIP_WAIT ]; do
+                    # Check if kube-vip pod exists and is running
+                    if kubectl get pod -n kube-system -l component=kube-vip --field-selector spec.nodeName=$NODE_NAME 2>/dev/null | grep -q Running; then
+                        echo "✅ kube-vip pod is running on this node"
+                        
+                        # Show pod info
+                        echo "📋 kube-vip pod information:"
+                        kubectl get pod -n kube-system -l component=kube-vip --field-selector spec.nodeName=$NODE_NAME -o wide
+                        
                         break
                     fi
-                    KUBELET_COUNT=$((KUBELET_COUNT + 1))
-                    echo "   Attempt $KUBELET_COUNT/$MAX_KUBELET_WAIT: Waiting for kubelet..."
-                    sleep 2
-                done
-                
-                # ✅ PERBAIKAN 7: Verify cluster connectivity
-                echo "🔍 Verifying cluster connectivity..."
-                MAX_CLUSTER_RETRIES=30
-                CLUSTER_COUNT=0
-                
-                while [ $CLUSTER_COUNT -lt $MAX_CLUSTER_RETRIES ]; do
-                    if kubectl cluster-info &>/dev/null; then
-                        echo "✅ Can access cluster via domain endpoint!"
-                        break
-                    fi
-                    CLUSTER_COUNT=$((CLUSTER_COUNT + 1))
-                    echo "   Attempt $CLUSTER_COUNT/$MAX_CLUSTER_RETRIES: Waiting for cluster access..."
-                    sleep 2
-                done
-                
-                if [ $CLUSTER_COUNT -eq $MAX_CLUSTER_RETRIES ]; then
-                    echo "⚠️  Warning: Cannot access cluster via domain, trying direct connection..."
                     
-                    # Try to get nodes without domain
-                    if kubectl get nodes &>/dev/null; then
-                        echo "✅ Can access cluster (fallback mode)"
-                    else
-                        echo "❌ Cannot access cluster!"
-                        echo "📋 Debugging info:"
-                        echo "   KUBECONFIG: $KUBECONFIG"
-                        echo "   Config content:"
-                        cat $HOME/.kube/config
-                        echo ""
-                        echo "   Kubelet status:"
-                        sudo systemctl status kubelet --no-pager || true
-                        exit 1
-                    fi
+                    VIP_COUNT=$((VIP_COUNT + 1))
+                    echo "   Attempt $VIP_COUNT/$MAX_VIP_WAIT: Waiting for kube-vip pod..."
+                    sleep 3
+                done
+                
+                if [ $VIP_COUNT -eq $MAX_VIP_WAIT ]; then
+                    echo "⚠️  Warning: kube-vip pod not running after $MAX_VIP_WAIT attempts"
+                    echo "📋 All kube-vip pods:"
+                    kubectl get pod -n kube-system -l component=kube-vip -o wide || true
+                    echo "📋 Static pod manifests:"
+                    sudo ls -la /etc/kubernetes/manifests/ || true
                 fi
-    
-                # ✅ PERBAIKAN 8: Verify node joined successfully
-                echo "🔍 Verifying node status..."
                 
-                # Get node name
-                NODE_NAME=$(hostname)
-                echo "   Node name: $NODE_NAME"
+                # ✅ PERBAIKAN 11: Final connectivity test
+                echo "🔍 Final connectivity test..."
                 
-                # Check if node appears in cluster
-                if kubectl get nodes | grep -q "$NODE_NAME"; then
-                    echo "✅ Node $NODE_NAME is registered in cluster"
-                    
-                    # Show node details
-                    kubectl get node "$NODE_NAME" -o wide || true
+                # Test API server via VIP
+                if curl -kfsS --connect-timeout 2 --max-time 4 https://${ENDPOINT}:6443/healthz &>/dev/null; then
+                    echo "✅ API server accessible via VIP endpoint"
                 else
-                    echo "⚠️  Warning: Node not yet visible in cluster"
-                    echo "   This may be normal - node registration can take a moment"
+                    echo "⚠️  Warning: API server not accessible via VIP endpoint"
+                    echo "📋 Testing direct connection to localhost:"
+                    curl -kfsS --connect-timeout 2 --max-time 4 https://127.0.0.1:6443/healthz || true
                 fi
                 
-                # Show all nodes
-                echo ""
-                echo "📊 Current cluster nodes:"
-                kubectl get nodes -o wide || echo "Cannot retrieve nodes list"
-    
-                echo ""
-                echo "✅ Node %s joined successfully"
-                echo "📋 Summary:"
-                echo "   - Kubeconfig: $KUBECONFIG"
-                echo "   - API Server: $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
-                echo "   - Node Status: $(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo 'Pending')"
+                # Show final cluster status
+                echo "📋 Final cluster status:"
+                kubectl get nodes -o wide
+                kubectl get pods -n kube-system -o wide | grep -E "kube-vip|etcd|apiserver" || true
+                
+                echo "✅ Node $NODE_NAME successfully joined and configured!"
             `,
 				cfg.K8sVIP,
-				nodes[i].Name,      // Display node name
-				cfg.K8sDOMAIN,      // Display endpoint
+				nodes[i].Name, // Display node name
+				cfg.K8sDOMAIN, // Display endpoint
+				cfg.K8sVIPInterface,
 				readJoinCmd.Stdout, // Inject join command
-				cfg.K8sDOMAIN,      // Ping test
-				cfg.K8sDOMAIN,      // API test
-				cfg.K8sDOMAIN,      // Display join endpoint
-				cfg.K8sDOMAIN,      // Update kubeconfig
-				cfg.K8sDOMAIN,      // Display updated endpoint
-				nodes[i].Name),     // Display node name
-		}, pulumi.DependsOn([]pulumi.Resource{readJoinCmd, copyVipDep, vipReachabilityCommands[i]}), pulumi.IgnoreChanges([]string{"create"}))
+				cfg.K8sDOMAIN),     // Ping test
+		}, pulumi.DependsOn([]pulumi.Resource{
+			etcdHealthCheck,
+			readJoinCmd,
+			copyVipDep,
+			vipReachabilityCommands[i],
+			waitVipManifest,
+		}), pulumi.IgnoreChanges([]string{"create"}))
 		if err != nil {
 			return nil, fmt.Errorf("gagal join node %d: %w", i, err)
 		}
-		joinCommands = append(joinCommands, joinNodeCmd)
+
+		postJoinEtcdStabilizeName := fmt.Sprintf("post-join-etcd-stabilize-%d", i)
+		postJoinEtcdStabilize, err := remote.NewCommand(ctx, postJoinEtcdStabilizeName, &remote.CommandArgs{
+			Connection: conn0,
+			Create: pulumi.Sprintf(`
+				set -Eeuo pipefail
+				
+				echo "🔄 Waiting etcd to fully stabilize after joining node %s..."
+				MAX_WAIT=300
+				COUNT=0
+				
+				while [ $COUNT -lt $MAX_WAIT ]; do
+					MEMBER_LIST=$(sudo ETCDCTL_API=3 etcdctl \
+						--endpoints=https://127.0.0.1:2379 \
+						--cacert=/etc/kubernetes/pki/etcd/ca.crt \
+						--cert=/etc/kubernetes/pki/etcd/server.crt \
+						--key=/etc/kubernetes/pki/etcd/server.key \
+						member list 2>/dev/null || true)
+					
+					if [ -n "$MEMBER_LIST" ]; then
+						LEARNER_COUNT=$(echo "$MEMBER_LIST" | grep -c "isLearner=true" || echo "0")
+						if [ "$LEARNER_COUNT" -eq 0 ]; then
+							if sudo ETCDCTL_API=3 etcdctl \
+								--endpoints=https://127.0.0.1:2379 \
+								--cacert=/etc/kubernetes/pki/etcd/ca.crt \
+								--cert=/etc/kubernetes/pki/etcd/server.crt \
+								--key=/etc/kubernetes/pki/etcd/server.key \
+								endpoint health >/dev/null 2>&1; then
+								echo "✅ etcd stable (no learners, endpoint healthy)"
+								sudo ETCDCTL_API=3 etcdctl \
+									--endpoints=https://127.0.0.1:2379 \
+									--cacert=/etc/kubernetes/pki/etcd/ca.crt \
+									--cert=/etc/kubernetes/pki/etcd/server.crt \
+									--key=/etc/kubernetes/pki/etcd/server.key \
+									endpoint status -w table || true
+								break
+							fi
+						fi
+					fi
+					
+					COUNT=$((COUNT + 1))
+					sleep 1
+				done
+				
+				if [ $COUNT -eq $MAX_WAIT ]; then
+					echo "❌ etcd not stable after ${MAX_WAIT}s"
+					echo "📋 member list:"
+					echo "$MEMBER_LIST"
+					exit 1
+				fi
+			`, nodes[i].Name),
+		}, pulumi.DependsOn([]pulumi.Resource{joinNodeCmd}))
+		if err != nil {
+			return nil, fmt.Errorf("gagal stabilisasi etcd post-join node %d: %w", i, err)
+		}
+
+		joinCommands = append(joinCommands, joinNodeCmd, postJoinEtcdStabilize)
+		previousJoin = postJoinEtcdStabilize
 	}
 
 	// 7. Verifikasi cluster health (setelah semua node join)
@@ -1345,6 +1871,27 @@ KUBECONFIG_EOF
             echo "📊 Cluster Status:"
             echo "=================="
             kubectl get nodes -o wide
+			
+			echo ""
+			echo "🗃️  etcd Status:"
+			echo "============="
+			ETCD_MEMBER_LIST=$(sudo ETCDCTL_API=3 etcdctl \
+				--endpoints=https://127.0.0.1:2379 \
+				--cacert=/etc/kubernetes/pki/etcd/ca.crt \
+				--cert=/etc/kubernetes/pki/etcd/server.crt \
+				--key=/etc/kubernetes/pki/etcd/server.key \
+				member list 2>/dev/null || true)
+			echo "$ETCD_MEMBER_LIST"
+			if echo "$ETCD_MEMBER_LIST" | grep -q "isLearner=true"; then
+				echo "❌ Found etcd learner member(s) still present"
+				exit 1
+			fi
+			sudo ETCDCTL_API=3 etcdctl \
+				--endpoints=https://127.0.0.1:2379 \
+				--cacert=/etc/kubernetes/pki/etcd/ca.crt \
+				--cert=/etc/kubernetes/pki/etcd/server.crt \
+				--key=/etc/kubernetes/pki/etcd/server.key \
+				endpoint status -w table || true
             
             # Show control plane pods
             echo ""
@@ -1354,9 +1901,10 @@ KUBECONFIG_EOF
             
             # Show kube-vip pods
             echo ""
-            echo "🔌 kube-vip Pods:"
-            echo "==================="
-            kubectl get pods -n kube-system -l app=kube-vip
+			echo "🔌 kube-vip Pods:"
+			echo "==================="
+			kubectl get pods -n kube-system -l app=kube-vip -o wide 2>/dev/null || true
+			kubectl get pods -n kube-system -l component=kube-vip -o wide 2>/dev/null || true
 
             # Show CNI pods
             echo ""
