@@ -8,11 +8,12 @@ import (
 	"k8s-ha-cluster/pkg/k8s"
 )
 
-func BootstrapArgoCD(ctx *pulumi.Context, cfg *config.Config, cluster *k8s.Cluster) error {
-	// Menjalankan instalasi Argo CD secara deklaratif 
+func BootstrapArgoCD(ctx *pulumi.Context, cfg *config.Config, cluster *k8s.Cluster, preflight pulumi.StringInput) error {
+	// Menjalankan instalasi Argo CD secara deklaratif
 	// (Menggunakan kubeconfig dari bootstrap phase)
 	_, err := local.NewCommand(ctx, "install-argocd", &local.CommandArgs{
 		Create: pulumi.Sprintf(`
+			echo "%s" > /dev/null
 			# Menyimpan kubeconfig sementara
 			echo "%s" > /tmp/kubeconfig-%s
 			export KUBECONFIG=/tmp/kubeconfig-%s
@@ -41,8 +42,8 @@ func BootstrapArgoCD(ctx *pulumi.Context, cfg *config.Config, cluster *k8s.Clust
 			      prune: true
 			      selfHeal: true
 			EOF
-		`, cluster.KubeConfig, cfg.PulumiStack, cfg.PulumiStack, cfg.ArgoCDProjectPrefix, cfg.GitOpsRepoURL, cfg.GitOpsBranch),
+		`, preflight, cluster.KubeConfig, cfg.PulumiStack, cfg.PulumiStack, cfg.ArgoCDProjectPrefix, cfg.GitOpsRepoURL, cfg.GitOpsBranch),
 	})
-	
+
 	return err
 }

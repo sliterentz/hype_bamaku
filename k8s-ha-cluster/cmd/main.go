@@ -44,8 +44,12 @@ func main() {
 			return fmt.Errorf("gagal bootstrap k8s: %w", err)
 		}
 
+		preflight := cluster.KubeConfig.ApplyT(func(kubeconfig string) (string, error) {
+			return k8s.PreflightKubeConfig(kubeconfig)
+		}).(pulumi.StringOutput)
+
 		// 5. GitOps Bootstrap (Argo CD)
-		err = gitops.BootstrapArgoCD(ctx, cfg, cluster)
+		err = gitops.BootstrapArgoCD(ctx, cfg, cluster, preflight)
 		if err != nil {
 			return fmt.Errorf("gagal setup GitOps: %w", err)
 		}
@@ -53,6 +57,7 @@ func main() {
 		// Outputs
 		ctx.Export("controlPlaneVIP", pulumi.String(cfg.K8sVIP))
 		ctx.Export("kubeconfig", cluster.KubeConfig)
+		ctx.Export("k8sPreflight", preflight)
 
 		// ✅ Export node IPs untuk debugging
 		for i, node := range nodes {

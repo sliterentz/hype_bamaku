@@ -54,6 +54,50 @@ k8s-ha-cluster/
    pulumi up
    ```
 
+## 🧰 Runbook: Menambah Control Plane Node
+
+Prosedur ini mengikuti pola pemindahan artefak yang sama dengan `kube-vip.yaml`: transfer terkontrol, verifikasi integritas, penyesuaian izin akses, lalu validasi pra-kondisi sebelum `kubeadm join`.
+
+1. **Siapkan node control-plane baru**
+   - Pastikan OS prereq terpenuhi (containerd aktif, swap off, time sync memadai).
+   - Pastikan konektivitas ke VIP/API server tersedia.
+
+2. **Stage `kube-vip.yaml` (belum aktif)**
+   - Pastikan file berada di `/etc/kubernetes/kube-vip/kube-vip.yaml` pada node baru.
+   - Jangan meletakkan `kube-vip.yaml` di `/etc/kubernetes/manifests/` sebelum join selesai untuk mencegah takeover VIP.
+
+3. **Pre-copy sertifikat wajib ke node baru**
+   - Sertifikat yang wajib ada di `/etc/kubernetes/pki/`:
+     - `ca.crt`, `ca.key`
+     - `etcd/ca.crt`, `etcd/ca.key`
+     - `front-proxy-ca.crt`, `front-proxy-ca.key`
+     - `sa.pub`, `sa.key`
+   - Mekanisme: dikemas sebagai tar.gz di node0, dihitung checksum SHA-256, ditransfer, diverifikasi checksum-nya di node tujuan, lalu diekstrak ke `/etc/kubernetes/pki/`.
+   - Izin akses:
+     - `600` untuk file kunci privat (`*.key`)
+     - `644` untuk sertifikat publik (`*.crt`) dan `sa.pub`
+
+4. **Validasi readiness sebelum join**
+   - Jalankan validasi artefak di node baru:
+     ```bash
+     sudo bash scripts/validate-join-artifacts.sh
+     ```
+   - Pastikan seluruh sertifikat wajib terdeteksi, format valid, dan permission sesuai.
+
+5. **Jalankan `kubeadm join --control-plane`**
+   - Gunakan join command yang dihasilkan oleh node0 (termasuk `--certificate-key`).
+   - Setelah join sukses, baru aktifkan kube-vip dengan memindahkan manifest ke `/etc/kubernetes/manifests/`.
+
+6. **Catatan penting: Endpoint domain vs VIP (anti self-target)**
+   - Jika `K8sDOMAIN` mengarah ke domain (mis. `dev.homelab.com`), pastikan DNS A record domain tersebut menunjuk ke VIP (mis. `192.168.1.100`), bukan ke salah satu IP node control-plane.
+   - Mekanisme join di automation ini akan:
+     - Menghapus mapping lama domain di `/etc/hosts` (jika ada),
+     - Menulis ulang mapping domain → VIP,
+     - Memaksa `kubeadm join` menggunakan VIP untuk menghindari drift DNS/hosts yang dapat menyebabkan node menarget dirinya sendiri (`connect: connection refused`).
+
+7. **Uji end-to-end di staging**
+   - Lakukan join control-plane di environment staging terlebih dahulu untuk memastikan prosedur pre-copy ini tidak memicu failure di fase join dan semua komponen (etcd, apiserver, kube-vip) stabil.
+
 ## 🔐 Manajemen Secrets
 Pada proyek ini, kredensial (seperti SSH key atau Token GitOps) disarankan **tidak di-hardcode**. 
 Gunakan mekanisme `pulumi config set --secret` atau **Pulumi ESC (Environments, Secrets, and Configuration)**, yang kemudian diakses dari object `ctx *pulumi.Context`.

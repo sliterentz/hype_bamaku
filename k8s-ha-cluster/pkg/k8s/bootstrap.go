@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/pulumi/pulumi-command/sdk/go/command/remote"
@@ -48,8 +49,16 @@ func Bootstrap(ctx *pulumi.Context, cfg *config.Config, nodes []*hyperv.Node) (*
 	if cfg.K8sVIP == "" {
 		return nil, fmt.Errorf("❌ K8sVIP tidak dikonfigurasi")
 	}
+	if net.ParseIP(cfg.K8sVIP) == nil {
+		return nil, fmt.Errorf("❌ K8sVIP tidak valid: %s", cfg.K8sVIP)
+	}
 	if cfg.K8sVIPInterface == "" {
 		return nil, fmt.Errorf("❌ K8sVIPInterface tidak dikonfigurasi")
+	}
+
+	controlPlaneEndpointHost := cfg.K8sDOMAIN
+	if ip := net.ParseIP(cfg.K8sDOMAIN); ip != nil && cfg.K8sDOMAIN != cfg.K8sVIP {
+		controlPlaneEndpointHost = cfg.K8sVIP
 	}
 
 	// Helper function dengan error handling
@@ -296,8 +305,16 @@ EOF
 			DOMAIN="%s"
 			VIP="%s"
 			ENDPOINT="$VIP"
-			if (command -v getent >/dev/null 2>&1 && getent hosts "$DOMAIN" >/dev/null 2>&1) || (command -v nslookup >/dev/null 2>&1 && nslookup "$DOMAIN" >/dev/null 2>&1); then
+			RESOLVED_IP=""
+			if command -v getent >/dev/null 2>&1; then
+				RESOLVED_IP=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)
+			elif command -v nslookup >/dev/null 2>&1; then
+				RESOLVED_IP=$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address: /{print $2; exit}' || true)
+			fi
+			if [ -n "$RESOLVED_IP" ] && [ "$RESOLVED_IP" = "$VIP" ]; then
 				ENDPOINT="$DOMAIN"
+			else
+				echo "⚠️  DOMAIN not resolvable to VIP; using VIP endpoint: $VIP" >&2
 			fi
 			echo "🚀 Initializing HA Kubernetes Control Plane (endpoint: ${ENDPOINT}:6443)"
 
@@ -320,14 +337,14 @@ EOF
 				echo "127.0.1.1 $(hostname)" | sudo -n tee -a /etc/hosts >/dev/null
 			fi
 
-            echo "🚀 Running kubeadm init..."
-            sudo kubeadm init \
-                --control-plane-endpoint "%s:6443" \
-                --apiserver-cert-extra-sans="%s,%s,%s" \
-                --upload-certs \
-                --pod-network-cidr="%s" \
-                --kubernetes-version=%s
-			sudo -n kubeadm init --config /tmp/kubeadm-config.yaml --upload-certs --v=5
+			echo "🚀 Running kubeadm init..."
+			sudo kubeadm init \
+				--control-plane-endpoint "%s:6443" \
+				--apiserver-cert-extra-sans="%s,%s,%s" \
+				--upload-certs \
+				--pod-network-cidr="%s" \
+				--kubernetes-version=%s \
+				--v=5
 
             echo "⏳ Waiting for kubelet to be ready..."
             for i in {1..30}; do
@@ -363,8 +380,7 @@ EOF
 			cfg.K8sVIP,
 			nodes[0].IPAddress,
 			cfg.K8sPodCIDR,
-			cfg.K8sVersion,
-			nodes[0].IPAddress),
+			cfg.K8sVersion),
 	}, pulumi.DependsOn(resetCommands))
 	if err != nil {
 		return nil, fmt.Errorf("gagal init kubeadm: %w", err)
@@ -643,47 +659,29 @@ EOF
 
             echo "Generating join command for control plane nodes..."
 
-            # ✅ PERBAIKAN 1: Update kubeadm-config ConfigMap SEBELUM generate join command
-            echo "🔄 Updating kubeadm-config ConfigMap to use domain/VIP endpoint..."
-            kubectl -n kube-system get configmap kubeadm-config -o yaml | \
-            sed "s|controlPlaneEndpoint:.*|controlPlaneEndpoint: %s:6443|g" | \
-            kubectl apply -f -
-            
-            # Verify update
-            echo "📋 Verifying ConfigMap update..."
-            CURRENT_ENDPOINT=$(kubectl -n kube-system get configmap kubeadm-config -o yaml | grep controlPlaneEndpoint | awk '{print $2}')
-            echo "   Current endpoint in ConfigMap: $CURRENT_ENDPOINT"
-            
-            if [ "$CURRENT_ENDPOINT" != "%s:6443" ]; then
-                echo "⚠️  Warning: ConfigMap update may not have applied correctly"
-                echo "   Expected: %s:6443"
-                echo "   Got: $CURRENT_ENDPOINT"
-            else
-                echo "✅ ConfigMap updated successfully"
-            fi
-    
-            # ✅ PERBAIKAN 2: Update kubeconfig untuk menggunakan domain endpoint
-            echo "🔄 Updating kubeconfig to use domain endpoint..."
-            kubectl config set-cluster kubernetes --server=https://%s:6443
-
-            # Tentukan endpoint yang akan digunakan
-			ENDPOINT_CANDIDATE="%s"
+			DOMAIN="%s"
 			VIP="%s"
-			if ping -c 1 -W 2 "$ENDPOINT_CANDIDATE" &>/dev/null || nslookup "$ENDPOINT_CANDIDATE" &>/dev/null; then
-				ENDPOINT="$ENDPOINT_CANDIDATE"
+			ENDPOINT="$VIP"
+			RESOLVED_IP=""
+			if command -v getent >/dev/null 2>&1; then
+				RESOLVED_IP=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)
+			elif command -v nslookup >/dev/null 2>&1; then
+				RESOLVED_IP=$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address: /{print $2; exit}' || true)
+			fi
+			echo "📋 Domain resolves to: ${RESOLVED_IP:-<unknown>}"
+			if [ -n "$RESOLVED_IP" ] && [ "$RESOLVED_IP" = "$VIP" ]; then
+				ENDPOINT="$DOMAIN"
 			else
-				ENDPOINT="$VIP"
-				echo "⚠️  DNS not resolvable, using VIP $ENDPOINT for ConfigMap"
+				echo "⚠️  DOMAIN not resolvable to VIP; using VIP endpoint: $VIP" >&2
 			fi
             
             # Backup original configmap
             # kubectl -n kube-system get configmap kubeadm-config -o yaml > /tmp/kubeadm-config.backup.yaml
 
-            # ✅ Update controlPlaneEndpoint di ClusterConfiguration
-            echo "🔄 Updating kubeadm-config ConfigMap..."
-            kubectl -n kube-system get configmap kubeadm-config -o yaml > /tmp/kubeadm-config.yaml
-            sed -i -E "s|^([[:space:]]*)controlPlaneEndpoint:.*|\\1controlPlaneEndpoint: \"${ENDPOINT}:6443\"|g" /tmp/kubeadm-config.yaml
-            kubectl apply -f /tmp/kubeadm-config.yaml
+			echo "🔄 Updating kubeadm-config ConfigMap..."
+			kubectl -n kube-system get configmap kubeadm-config -o yaml > /tmp/kubeadm-config.yaml
+			sed -i -E "s|^([[:space:]]*)controlPlaneEndpoint:.*|\\1controlPlaneEndpoint: \"${ENDPOINT}:6443\"|g" /tmp/kubeadm-config.yaml
+			kubectl apply -f /tmp/kubeadm-config.yaml
             
             # Verify update
             echo "📋 Verifying ConfigMap update..."
@@ -698,14 +696,12 @@ EOF
                 echo "✅ ConfigMap updated successfully"
             fi
     
-            # ✅ PERBAIKAN 2: Update kubeconfig
-            echo "🔄 Updating kubeconfig..."
-            export KUBECONFIG=$HOME/.kube/config
-            kubectl config set-cluster kubernetes --server=https://${ENDPOINT}:6443
+			echo "🔄 Updating kubeconfig..."
+			export KUBECONFIG=$HOME/.kube/config
+			kubectl config set-cluster kubernetes --server=https://${ENDPOINT}:6443
             
-            # Verify kubeconfig update
-            CURRENT_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
-            echo "📋 Current kubeconfig server: $CURRENT_SERVER"
+			CURRENT_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")
+			echo "📋 Current kubeconfig server: $CURRENT_SERVER"
             
             # ✅ PERBAIKAN 3: Test connectivity sebelum generate join command
             echo "🔍 Testing API server connectivity..."
@@ -889,13 +885,10 @@ EOF
             sudo chmod 644 /tmp/k8s-join-command.txt
             
             echo "✅ Join command generated and saved successfully"
-        `,
-			cfg.K8sDOMAIN,
-			cfg.K8sDOMAIN,
-			cfg.K8sDOMAIN,
-			cfg.K8sDOMAIN,
-			cfg.K8sDOMAIN,
-			cfg.K8sVIP),
+		`,
+			controlPlaneEndpointHost,
+			cfg.K8sVIP,
+		),
 	}, pulumi.DependsOn(append([]pulumi.Resource{cniCmd}, vipReachabilityCommands...)), pulumi.IgnoreChanges([]string{"create"}))
 	if err != nil {
 		return nil, fmt.Errorf("gagal generate join command: %w", err)
@@ -908,19 +901,18 @@ EOF
 	for i := 1; i < len(nodes); i++ {
 		conn1 := createConnection(nodes[i])
 
-		// Step 1: Baca manifest dari primary node (node 0)
+		// ========================================
+		// STEP 1: Copy kube-vip manifest
+		// ========================================
+
+		// Step 1a: Baca manifest dari primary node (node 0)
 		readManifestName := fmt.Sprintf("read-kube-vip-manifest-%d", i)
 		readManifestCmd, err := remote.NewCommand(ctx, readManifestName, &remote.CommandArgs{
 			Connection: conn0, // ✅ Baca dari primary node
 			Create: pulumi.String(`
 				set -Eeuo pipefail
 
-				echo "🔄 Updating kubeadm-config ConfigMap..." >&2
-				{ kubectl -n kube-system get configmap kubeadm-config -o yaml | \
-					sed "s|controlPlaneEndpoint:.*|controlPlaneEndpoint: %s:6443|g" | \
-					kubectl apply -f -; } 1>&2
-
-				echo "📖 Reading kube-vip manifest from primary node..." >&2
+				echo " Reading kube-vip manifest from primary node..." >&2
 
 				if [ -f /tmp/kube-vip-manifest.yaml ]; then
 					sudo cat /tmp/kube-vip-manifest.yaml
@@ -942,7 +934,7 @@ EOF
 
 		// ✅ SOLUSI 1: Gunakan remote.NewCommand dengan scp built-in
 		// Lebih reliable daripada manual scp karena menggunakan Pulumi's SSH connection
-		// Step 2: Write manifest ke secondary node (node i)
+		// Step 1b: Write manifest ke secondary node
 		writeManifestName := fmt.Sprintf("write-kube-vip-manifest-%d", i)
 		writeManifestCmd, err := remote.NewCommand(ctx, writeManifestName, &remote.CommandArgs{
 			Connection: conn1, // ✅ Write ke secondary node
@@ -1065,6 +1057,159 @@ MANIFEST_EOF
 			return nil, fmt.Errorf("gagal copy kube-vip manifest ke node %d: %w", i, err)
 		}
 
+		// ========================================
+		// STEP 2: Copy Kubernetes Certificates
+		// ========================================
+
+		// Step 2a: Baca certificates dari primary node
+		readCertsName := fmt.Sprintf("read-k8s-certificates-%d", i)
+		readCertsCmd, err := remote.NewCommand(ctx, readCertsName, &remote.CommandArgs{
+			Connection: conn0,
+			Create: pulumi.String(`
+                set -Eeuo pipefail
+                
+                echo "🔐 Reading Kubernetes certificates from primary node..." >&2
+                
+                REQUIRED_CERTS=(
+                    "/etc/kubernetes/pki/ca.crt"
+                    "/etc/kubernetes/pki/ca.key"
+                    "/etc/kubernetes/pki/sa.key"
+                    "/etc/kubernetes/pki/sa.pub"
+                    "/etc/kubernetes/pki/front-proxy-ca.crt"
+                    "/etc/kubernetes/pki/front-proxy-ca.key"
+                    "/etc/kubernetes/pki/etcd/ca.crt"
+                    "/etc/kubernetes/pki/etcd/ca.key"
+                )
+                
+                for cert in "${REQUIRED_CERTS[@]}"; do
+                    if [ ! -f "$cert" ]; then
+                        echo "❌ Required certificate not found: $cert" >&2
+                        exit 1
+                    fi
+                done
+                
+                echo "✅ All required certificates found" >&2
+                
+                echo "📦 Creating certificate archive..." >&2
+                sudo tar czf /tmp/k8s-pki-certs.tar.gz \
+                    -C /etc/kubernetes/pki \
+                    ca.crt ca.key \
+                    sa.key sa.pub \
+                    front-proxy-ca.crt front-proxy-ca.key \
+                    etcd/ca.crt etcd/ca.key
+                
+                if [ ! -f /tmp/k8s-pki-certs.tar.gz ]; then
+                    echo "❌ Failed to create certificate archive!" >&2
+                    exit 1
+                fi
+                
+                TARBALL_SIZE=$(sudo wc -c < /tmp/k8s-pki-certs.tar.gz)
+                echo "✅ Certificate archive created (size: ${TARBALL_SIZE} bytes)" >&2
+
+                sudo chmod 600 /tmp/k8s-pki-certs.tar.gz
+
+                CHK=$(sudo openssl dgst -sha256 -r /tmp/k8s-pki-certs.tar.gz | awk '{print $1}')
+                if [ -z "$CHK" ]; then
+                    echo "❌ Failed to compute checksum for certificate archive" >&2
+                    exit 1
+                fi
+
+                echo "$CHK"
+                sudo base64 -w 0 /tmp/k8s-pki-certs.tar.gz
+                echo
+                
+                # Cleanup
+                sudo rm -f /tmp/k8s-pki-certs.tar.gz
+            `),
+		}, pulumi.DependsOn([]pulumi.Resource{vipCmd, cniCmd}))
+
+		if err != nil {
+			return nil, fmt.Errorf("gagal read certificates: %w", err)
+		}
+
+		// Step 2b: Write certificates ke secondary node
+		writeCertsName := fmt.Sprintf("write-k8s-certificates-%d", i)
+		writeCertsCmd, err := remote.NewCommand(ctx, writeCertsName, &remote.CommandArgs{
+			Connection: conn1,
+			Create: pulumi.Sprintf(`
+                set -Eeuo pipefail
+                
+                echo "🔐 Pre-copy Kubernetes certificates on node %s..."
+
+                sudo mkdir -p /etc/kubernetes/pki/etcd
+                sudo chmod 755 /etc/kubernetes /etc/kubernetes/pki /etc/kubernetes/pki/etcd
+                sudo chown -R root:root /etc/kubernetes
+
+                # Langsung assign ke variable tanpa heredoc
+                CERT_BUNDLE_RAW='%s'
+
+                EXPECTED_CHK=$(echo "$CERT_BUNDLE_RAW" | head -n 1 | tr -d '\r' | tr -d '[:space:]')
+                PAYLOAD=$(echo "$CERT_BUNDLE_RAW" | tail -n +2 | tr -d '\r' | tr -d '\n')
+
+                if [ -z "$EXPECTED_CHK" ] || [ -z "$PAYLOAD" ]; then
+                    echo "❌ Certificate bundle is empty or malformed"
+                    exit 1
+                fi
+
+                TMP_TARBALL="/tmp/k8s-pki-certs.tar.gz"
+                echo "$PAYLOAD" | base64 -d | sudo tee "${TMP_TARBALL}.tmp" >/dev/null
+                sudo mv -f "${TMP_TARBALL}.tmp" "$TMP_TARBALL"
+                sudo chown root:root "$TMP_TARBALL"
+                sudo chmod 600 "$TMP_TARBALL"
+
+                ACTUAL_CHK=$(sudo openssl dgst -sha256 -r "$TMP_TARBALL" | awk '{print $1}')
+                if [ "$ACTUAL_CHK" != "$EXPECTED_CHK" ]; then
+                    echo "❌ Certificate archive checksum mismatch"
+                    echo "   expected=$EXPECTED_CHK"
+                    echo "   actual=$ACTUAL_CHK"
+                    exit 1
+                fi
+
+                sudo tar xzf "$TMP_TARBALL" -C /etc/kubernetes/pki
+                sudo rm -f "$TMP_TARBALL"
+
+                sudo chown -R root:root /etc/kubernetes/pki
+                sudo chmod 600 /etc/kubernetes/pki/*.key /etc/kubernetes/pki/etcd/*.key
+                sudo chmod 644 /etc/kubernetes/pki/*.crt /etc/kubernetes/pki/etcd/*.crt /etc/kubernetes/pki/*.pub
+
+                echo "🔍 Validating required certificates..."
+                REQUIRED_CERTS=(
+                    "/etc/kubernetes/pki/ca.crt"
+                    "/etc/kubernetes/pki/ca.key"
+                    "/etc/kubernetes/pki/sa.key"
+                    "/etc/kubernetes/pki/sa.pub"
+                    "/etc/kubernetes/pki/front-proxy-ca.crt"
+                    "/etc/kubernetes/pki/front-proxy-ca.key"
+                    "/etc/kubernetes/pki/etcd/ca.crt"
+                    "/etc/kubernetes/pki/etcd/ca.key"
+                )
+                
+                for cert in "${REQUIRED_CERTS[@]}"; do
+                    if [ ! -s "$cert" ]; then
+                        echo "❌ Required certificate missing/empty: $cert"
+                        exit 1
+                    fi
+                done
+                sudo openssl x509 -in /etc/kubernetes/pki/ca.crt -noout -subject >/dev/null
+                sudo openssl x509 -in /etc/kubernetes/pki/front-proxy-ca.crt -noout -subject >/dev/null
+                sudo openssl x509 -in /etc/kubernetes/pki/etcd/ca.crt -noout -subject >/dev/null
+
+                sudo openssl pkey -in /etc/kubernetes/pki/ca.key -noout >/dev/null
+                sudo openssl pkey -in /etc/kubernetes/pki/front-proxy-ca.key -noout >/dev/null
+                sudo openssl pkey -in /etc/kubernetes/pki/etcd/ca.key -noout >/dev/null
+                sudo openssl pkey -in /etc/kubernetes/pki/sa.key -noout >/dev/null
+
+                echo "✅ Pre-copy certificates complete"
+            `,
+				nodes[i].Name,
+				readCertsCmd.Stdout,
+			),
+		}, pulumi.DependsOn([]pulumi.Resource{readCertsCmd, writeManifestCmd}))
+
+		if err != nil {
+			return nil, fmt.Errorf("gagal copy certificates ke node %d: %w", i, err)
+		}
+
 		// Step 1b: Baca kubeconfig dari primary node (node 0)
 		readKubeconfigName := fmt.Sprintf("read-kubeconfig-%d", i)
 		readKubeconfigCmd, err := remote.NewCommand(ctx, readKubeconfigName, &remote.CommandArgs{
@@ -1096,7 +1241,7 @@ KUBECONFIG_EOF
                 sudo chmod 600 $HOME/.kube/config
                 echo "✅ kubeconfig copied successfully"
             `, readKubeconfigCmd.Stdout),
-		}, pulumi.DependsOn([]pulumi.Resource{readKubeconfigCmd, writeManifestCmd}))
+		}, pulumi.DependsOn([]pulumi.Resource{readKubeconfigCmd, writeManifestCmd, writeCertsCmd}))
 
 		if err != nil {
 			return nil, fmt.Errorf("gagal copy kubeconfig ke node %d: %w", i, err)
@@ -1337,7 +1482,7 @@ KUBECONFIG_EOF
 				set -Eeuo pipefail
 
 				STEP="join-node"
-				trap 'rc=$?; echo "❌ ${STEP} failed (rc=$rc)"; echo "📋 routes:"; ip -4 route || true; echo "📋 neigh:"; ip neigh show || true; echo "📋 kubelet:"; sudo journalctl -u kubelet -n 80 --no-pager || true; exit $rc' ERR
+				trap 'rc=$?; echo "❌ ${STEP} failed (rc=$rc)"; echo "📋 endpoint=$ENDPOINT vip=$VIP iface=$IFACE"; echo "📋 /etc/hosts (VIP):"; sudo grep -nF "$VIP" /etc/hosts || true; echo "📋 /etc/hosts (ENDPOINT):"; sudo grep -nF "$ENDPOINT" /etc/hosts || true; echo "📋 kubelet.conf server:"; sudo grep -n "server:" /etc/kubernetes/kubelet.conf 2>/dev/null | head -n 3 || true; echo "📋 bootstrap-kubelet.conf server:"; sudo grep -n "server:" /etc/kubernetes/bootstrap-kubelet.conf 2>/dev/null | head -n 3 || true; echo "📋 routes:"; ip -4 route || true; echo "📋 neigh:"; ip neigh show || true; echo "📋 kubelet:"; sudo journalctl -u kubelet -n 80 --no-pager || true; exit $rc' ERR
 
 				VIP="%s"
 				NODE_NAME="%s"
@@ -1345,20 +1490,27 @@ KUBECONFIG_EOF
 				IFACE="%s"
 
 				echo "🚀 Joining node $NODE_NAME to cluster..."
+                echo "📋 Configuration:"
 				echo "   Using endpoint: $ENDPOINT:6443"
+                echo "   VIP: $VIP"
 				echo "   Using interface: $IFACE"
+                echo ""
 				
 				echo "🏷️  Ensuring hostname matches expected node name..."
 				sudo hostnamectl set-hostname "$NODE_NAME" || true
 				CURRENT_HOST_FQDN=$(hostname -f 2>/dev/null || hostname)
 				echo "📋 Current hostname: $CURRENT_HOST_FQDN"
 				
-				echo "🧭 Verifying endpoint DNS resolution..."
+				echo "🧭 Verifying endpoint DNS resolution (best-effort)..."
 				RESOLVED_IP=""
 				if command -v getent >/dev/null 2>&1; then
 					RESOLVED_IP=$(getent ahostsv4 "$ENDPOINT" | awk '{print $1; exit}' || true)
 				elif command -v nslookup >/dev/null 2>&1; then
 					RESOLVED_IP=$(nslookup "$ENDPOINT" 2>/dev/null | awk '/^Address: /{print $2; exit}' || true)
+				elif command -v python3 >/dev/null 2>&1; then
+					RESOLVED_IP=$(python3 -c 'import socket,sys; print(socket.gethostbyname(sys.argv[1]))' "$ENDPOINT" 2>/dev/null || true)
+				elif command -v python >/dev/null 2>&1; then
+					RESOLVED_IP=$(python -c 'import socket,sys; print(socket.gethostbyname(sys.argv[1]))' "$ENDPOINT" 2>/dev/null || true)
 				fi
 				echo "📋 $ENDPOINT resolves to: ${RESOLVED_IP:-<unknown>}"
 				
@@ -1377,9 +1529,37 @@ KUBECONFIG_EOF
 					exit 1
 				fi
 				
-				echo "🧾 Ensuring /etc/hosts maps endpoint to VIP (defensive against DNS issues)..."
-				if ! grep -qE "^[[:space:]]*${VIP}[[:space:]]+${ENDPOINT}([[:space:]]+|$)" /etc/hosts; then
-					echo "${VIP} ${ENDPOINT}" | sudo tee -a /etc/hosts >/dev/null
+				if [[ "$ENDPOINT" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+					echo "🧾 Endpoint is an IP; skipping /etc/hosts mapping"
+				else
+					echo "🧾 Ensuring /etc/hosts maps endpoint to VIP (authoritative)..."
+					HOSTS_TMP="/tmp/hosts.k8s-ha.tmp"
+					sudo cp -f /etc/hosts "/etc/hosts.bak.k8s-ha.$(date +%s)"
+					sudo awk -v ep="$ENDPOINT" '{
+						if ($0 ~ /^[[:space:]]*#/ || NF < 2) { print; next }
+						for (i = 2; i <= NF; i++) {
+							if ($i == ep) next
+						}
+						print
+					}' /etc/hosts | sudo tee "$HOSTS_TMP" >/dev/null
+					echo "${VIP} ${ENDPOINT}" | sudo tee -a "$HOSTS_TMP" >/dev/null
+					sudo mv -f "$HOSTS_TMP" /etc/hosts
+					sudo chown root:root /etc/hosts
+					sudo chmod 644 /etc/hosts
+
+					if command -v getent >/dev/null 2>&1; then
+						RESOLVED_POST=$(getent ahostsv4 "$ENDPOINT" | awk '{print $1; exit}' || true)
+						echo "📋 Post /etc/hosts mapping: $ENDPOINT resolves to: ${RESOLVED_POST:-<unknown>}"
+						if [ -n "$RESOLVED_POST" ] && [ "$RESOLVED_POST" != "$VIP" ]; then
+							echo "❌ Endpoint $ENDPOINT still does not resolve to VIP ($VIP) after /etc/hosts update"
+							exit 1
+						fi
+					else
+						if ! grep -qE "^[[:space:]]*${VIP}[[:space:]]+${ENDPOINT}([[:space:]]+|$)" /etc/hosts; then
+							echo "❌ /etc/hosts mapping not present for endpoint=$ENDPOINT vip=$VIP"
+							exit 1
+						fi
+					fi
 				fi
 				
 				echo "🧹 Ensuring kube-vip manifest is staged (not active) before join..."
@@ -1426,11 +1606,19 @@ KUBECONFIG_EOF
                 echo "🧹 Cleaning up previous kubelet state..."
                 sudo rm -rf /var/lib/kubelet/* || true
                 sudo rm -rf /etc/kubernetes/kubelet.conf || true
-                sudo rm -rf /etc/kubernetes/pki/ca.crt || true
                 sudo rm -rf /etc/kubernetes/bootstrap-kubelet.conf || true
                 
                 # ✅ PERBAIKAN: Inject join command langsung dari Pulumi Output
                 JOIN_CMD='%s'
+				JOIN_CMD=$(printf '%s' "$JOIN_CMD" | tr -d '\r')
+
+				echo "🔧 Forcing join endpoint to VIP to avoid DNS/hosts drift..."
+				JOIN_CMD=$(echo "$JOIN_CMD" | sed -E "s/(kubeadm join)[[:space:]]+[^[:space:]]+:6443/\\1 ${VIP}:6443/")
+				if ! echo "$JOIN_CMD" | grep -q "kubeadm join ${VIP}:6443"; then
+					echo "❌ Failed to enforce join endpoint to VIP"
+					echo "📋 JOIN_CMD=$JOIN_CMD"
+					exit 1
+				fi
                 
                 # Validate join command
                 if [ -z "$JOIN_CMD" ]; then
@@ -1450,13 +1638,34 @@ KUBECONFIG_EOF
                 export KUBECONFIG=$HOME/.kube/config
                 echo "📋 Using KUBECONFIG=$KUBECONFIG"
                 
+				echo "🔍 Validating pre-copied PKI assets exist..."
+				REQUIRED_CERTS=(
+					"/etc/kubernetes/pki/ca.crt"
+					"/etc/kubernetes/pki/ca.key"
+					"/etc/kubernetes/pki/sa.key"
+					"/etc/kubernetes/pki/sa.pub"
+					"/etc/kubernetes/pki/front-proxy-ca.crt"
+					"/etc/kubernetes/pki/front-proxy-ca.key"
+					"/etc/kubernetes/pki/etcd/ca.crt"
+					"/etc/kubernetes/pki/etcd/ca.key"
+				)
+				for cert in "${REQUIRED_CERTS[@]}"; do
+					if [ ! -s "$cert" ]; then
+						echo "❌ Missing/empty: $cert"
+						sudo ls -la /etc/kubernetes/pki || true
+						sudo ls -la /etc/kubernetes/pki/etcd || true
+						exit 1
+					fi
+				done
+				echo "✅ PKI assets present"
+
                 # ✅ PERBAIKAN 1: Test connectivity SEBELUM join
                 echo "🔍 Testing connectivity to control plane..."
                 MAX_PING_RETRIES=10
                 PING_COUNT=0
                 
                 while [ $PING_COUNT -lt $MAX_PING_RETRIES ]; do
-                    if ping -c 2 %s &>/dev/null; then
+                    if ping -c 2 "$VIP" &>/dev/null; then
                         echo "✅ Can ping control plane endpoint"
                         break
                     fi
@@ -1477,7 +1686,7 @@ KUBECONFIG_EOF
                 API_COUNT=0
                 
                 while [ $API_COUNT -lt $MAX_API_RETRIES ]; do
-					if curl -kfsS --connect-timeout 2 --max-time 4 https://$ENDPOINT:6443/healthz &>/dev/null; then
+					if curl -kfsS --connect-timeout 2 --max-time 4 https://$VIP:6443/healthz &>/dev/null; then
                         echo "✅ API server is responding"
                         break
                     fi
@@ -1487,7 +1696,7 @@ KUBECONFIG_EOF
                 done
 
 				if [ $API_COUNT -eq $MAX_API_RETRIES ]; then
-					echo "❌ API server not reachable via endpoint"
+					echo "❌ API server not reachable via VIP"
 					echo "📋 testing VIP healthz directly: https://$VIP:6443/healthz"
 					curl -vk --connect-timeout 2 --max-time 4 "https://$VIP:6443/healthz" || true
 					exit 1
@@ -1772,13 +1981,12 @@ KUBECONFIG_EOF
                 kubectl get pods -n kube-system -o wide | grep -E "kube-vip|etcd|apiserver" || true
                 
                 echo "✅ Node $NODE_NAME successfully joined and configured!"
-            `,
+			`,
 				cfg.K8sVIP,
-				nodes[i].Name, // Display node name
-				cfg.K8sDOMAIN, // Display endpoint
+				nodes[i].Name,
+				controlPlaneEndpointHost,
 				cfg.K8sVIPInterface,
-				readJoinCmd.Stdout, // Inject join command
-				cfg.K8sDOMAIN),     // Ping test
+				readJoinCmd.Stdout),
 		}, pulumi.DependsOn([]pulumi.Resource{
 			etcdHealthCheck,
 			readJoinCmd,
