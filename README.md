@@ -57,59 +57,32 @@ Klaster ini dirancang untuk ketersediaan tinggi dengan dua node control plane ya
 ### Diagram Topologi Klaster
 
 ```mermaid
-graph TD
-    subgraph Hyper-V Host
-        subgraph Control Plane Node 1 (k8s-ha-cp-1)
-            kubelet1[Kubelet]
-            kube-apiserver1[kube-apiserver]
-            kube-scheduler1[kube-scheduler]
-            kube-controller-manager1[kube-controller-manager]
-            etcd1[etcd]
-            kube-vip-pod1[kube-vip Pod]
-        end
-
-        subgraph Control Plane Node 2 (k8s-ha-cp-2)
-            kubelet2[Kubelet]
-            kube-apiserver2[kube-apiserver]
-            kube-scheduler2[kube-scheduler]
-            kube-controller-manager2[kube-controller-manager]
-            etcd2[etcd]
-            kube-vip-pod2[kube-vip Pod]
-        end
-
-        subgraph Worker Node (Optional)
-            kubeletW[Kubelet]
-            kube-proxyW[Kube-Proxy]
-            containerdW[Containerd]
-        end
-
-        VIP_LB(Virtual IP Load Balancer)
-    end
-
-    User[Pengguna/kubectl] --> VIP_LB
-    VIP_LB --> kube-apiserver1
-    VIP_LB --> kube-apiserver2
-
-    kube-apiserver1 <--> etcd1
-    kube-apiserver1 <--> etcd2
-    kube-apiserver2 <--> etcd1
-    kube-apiserver2 <--> etcd2
-
-    kube-apiserver1 <--> kubelet1
-    kube-apiserver1 <--> kubelet2
-    kube-apiserver2 <--> kubelet1
-    kube-apiserver2 <--> kubelet2
-
-    kube-apiserver1 <--> kube-scheduler1
-    kube-apiserver1 <--> kube-controller-manager1
-    kube-apiserver2 <--> kube-scheduler2
-    kube-apiserver2 <--> kube-controller-manager2
-
-    kube-vip-pod1 -- manages --> VIP_LB
-    kube-vip-pod2 -- manages --> VIP_LB
-
-    kube-apiserver1 <--> kubeletW
-    kube-apiserver2 <--> kubeletW
+flowchart TD
+    client["kubectl clients<br>https://192.168.0.97:6443"]
+    vip["API VIP 192.168.0.97 (kube-vip, L2/ARP)<br>active on ONE node at a time"]
+    
+    node1["k8s-1.maksonlee.com<br>192.168.0.99<br><br>- etcd<br>- apiserver<br>- controller<br>- scheduler<br>- kubelet<br>- kube-vip Pod<br>- MetalLB speaker<br>- Traefik<br>  (Deployment, 3 replicas)<br>- workloads"]
+    node2["k8s-2.maksonlee.com<br>192.168.0.100<br><br>- etcd<br>- apiserver<br>- controller<br>- scheduler<br>- kubelet<br>- kube-vip Pod<br>- MetalLB speaker<br>- Traefik<br>  (Deployment, 3 replicas)<br>- workloads"]
+    node3["k8s-3.maksonlee.com<br>192.168.0.101<br><br>- etcd<br>- apiserver<br>- controller<br>- scheduler<br>- kubelet<br>- kube-vip Pod<br>- MetalLB speaker<br>- Traefik<br>  (Deployment, 3 replicas)<br>- workloads"]
+    
+    mlb["MetalLB speakers on all nodes (L2 mode)<br>but ONLY ONE node at a time announces<br>192.168.0.98 to the LAN"]
+    traefik["Traefik LoadBalancer Service<br>(Ingress for web application)"]
+    
+    client -.- vip
+    vip --> node1
+    vip --> node2
+    vip --> node3
+    
+    node1 -.- mlb
+    node2 -.- mlb
+    node3 -.- mlb
+    
+    mlb --> traefik
+    
+    style client fill:#ffecb3,stroke:#ffb300,stroke-width:1px
+    style node1 fill:#e3f2fd,stroke:#90caf9,stroke-width:1px
+    style node2 fill:#e3f2fd,stroke:#90caf9,stroke-width:1px
+    style node3 fill:#e3f2fd,stroke:#90caf9,stroke-width:1px
 ```
 *Diagram ini menunjukkan topologi klaster HA dengan dua node control plane dan satu VIP yang dikelola oleh kube-vip. Node worker dapat ditambahkan sesuai kebutuhan.*
 

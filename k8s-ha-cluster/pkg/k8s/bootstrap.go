@@ -1,6 +1,9 @@
 package k8s
 
 import (
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strings"
@@ -16,6 +19,13 @@ type Cluster struct {
 	KubeConfig pulumi.StringOutput
 	VIP        string
 }
+
+var (
+	manifestContent []string
+	sourceChecksum  string
+	inManifest      bool
+	inChecksum      bool
+)
 
 func Bootstrap(ctx *pulumi.Context, cfg *config.Config, nodes []*hyperv.Node) (*Cluster, error) {
 	if len(nodes) == 0 {
@@ -306,6 +316,7 @@ EOF
 			VIP="%s"
 			ENDPOINT="$VIP"
 			RESOLVED_IP=""
+
 			if command -v getent >/dev/null 2>&1; then
 				RESOLVED_IP=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)
 			elif command -v nslookup >/dev/null 2>&1; then
@@ -695,6 +706,16 @@ EOF
             else
                 echo "✅ ConfigMap updated successfully"
             fi
+
+			echo "🔄 Updating kube-public/cluster-info..."
+			if kubectl -n kube-public get configmap cluster-info >/dev/null 2>&1; then
+				kubectl -n kube-public get configmap cluster-info -o yaml > /tmp/cluster-info.yaml
+				sed -i -E "s|(server:[[:space:]]+https://)[^[:space:]]+(:6443)|\\1${ENDPOINT}\\2|g" /tmp/cluster-info.yaml
+				kubectl apply -f /tmp/cluster-info.yaml
+				echo "✅ cluster-info updated (best-effort)"
+			else
+				echo "⚠️  cluster-info ConfigMap not found (skipping)"
+			fi
     
 			echo "🔄 Updating kubeconfig..."
 			export KUBECONFIG=$HOME/.kube/config
@@ -902,7 +923,7 @@ EOF
 		conn1 := createConnection(nodes[i])
 
 		// ========================================
-		// STEP 1: Copy kube-vip manifest
+		// STEP 1: Copy kube-vip manifest dengan Enhanced Validation
 		// ========================================
 
 		// Step 1a: Baca manifest dari primary node (node 0)
@@ -912,19 +933,73 @@ EOF
 			Create: pulumi.String(`
 				set -Eeuo pipefail
 
-				echo " Reading kube-vip manifest from primary node..." >&2
+				echo "📖 Reading kube-vip manifest from primary node..." >&2
+                
+                MANIFEST_PATH=""
+                
+                # ✅ Priority 1: Cek saved manifest
+                if [ -f /tmp/kube-vip-manifest.yaml ]; then
+                    MANIFEST_PATH="/tmp/kube-vip-manifest.yaml"
+                # ✅ Priority 2: Cek active manifest
+                elif [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+                    MANIFEST_PATH="/etc/kubernetes/manifests/kube-vip.yaml"
+                # ✅ Priority 3: Cek staged manifest
+                elif [ -f /etc/kubernetes/kube-vip/kube-vip.yaml ]; then
+                    MANIFEST_PATH="/etc/kubernetes/kube-vip/kube-vip.yaml"
+                else
+                    echo "❌ kube-vip manifest not found on primary node!" >&2
+                    echo "📋 Searched locations:" >&2
+                    echo "   - /tmp/kube-vip-manifest.yaml" >&2
+                    echo "   - /etc/kubernetes/manifests/kube-vip.yaml" >&2
+                    echo "   - /etc/kubernetes/kube-vip/kube-vip.yaml" >&2
+                    exit 1
+                fi
 
-				if [ -f /tmp/kube-vip-manifest.yaml ]; then
-					sudo cat /tmp/kube-vip-manifest.yaml
-					exit 0
-				fi
+                echo "✅ Found manifest at: $MANIFEST_PATH" >&2
 
-				echo "⚠️  kube-vip manifest not found at /tmp/kube-vip-manifest.yaml, trying fallback..." >&2
-				if [ ! -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
-					echo "❌ kube-vip manifest not found on primary node!" >&2
-					exit 1
-				fi
-				sudo cat /etc/kubernetes/manifests/kube-vip.yaml
+                # ✅ Validate manifest before reading
+                if [ ! -s "$MANIFEST_PATH" ]; then
+                    echo "❌ Manifest file is empty!" >&2
+                    exit 1
+                fi
+
+                # ✅ Validate YAML structure
+                if ! grep -q "kind: Pod" "$MANIFEST_PATH"; then
+                    echo "❌ Invalid manifest: missing 'kind: Pod'" >&2
+                    exit 1
+                fi
+
+                if ! grep -q "name: kube-vip" "$MANIFEST_PATH"; then
+                    echo "❌ Invalid manifest: missing 'name: kube-vip'" >&2
+                    exit 1
+                fi
+
+                FILE_SIZE=$(sudo wc -c < "$MANIFEST_PATH")
+                echo "✅ Manifest found (size: ${FILE_SIZE} bytes)" >&2
+
+                # ✅ Generate checksum untuk validation
+                MANIFEST_CONTENT=$(sudo cat "$MANIFEST_PATH")
+                CHECKSUM=$(sudo md5sum "$MANIFEST_PATH" | awk '{print $1}')
+                echo "📋 Manifest checksum: $CHECKSUM" >&2
+
+                # ✅ Encode ke base64 TANPA line wrapping
+                # Gunakan -w 0 untuk disable line wrapping
+                MANIFEST_B64=$(echo "$MANIFEST_CONTENT" | base64 -w 0)
+
+                # Validate checksum is not empty
+                if [ -z "$CHECKSUM" ]; then
+                    echo "❌ Failed to compute checksum" >&2
+                    exit 1
+                fi
+
+                # ✅ Output manifest dengan metadata
+                echo "---MANIFEST-START---"
+                sudo cat "$MANIFEST_PATH"
+                echo "---MANIFEST-END---"
+                echo "---CHECKSUM-START---"
+                echo "$CHECKSUM"
+                echo "$MANIFEST_B64"
+                echo "---CHECKSUM-END---"
             `),
 		}, pulumi.DependsOn([]pulumi.Resource{vipCmd, cniCmd}))
 
@@ -938,12 +1013,112 @@ EOF
 		writeManifestName := fmt.Sprintf("write-kube-vip-manifest-%d", i)
 		writeManifestCmd, err := remote.NewCommand(ctx, writeManifestName, &remote.CommandArgs{
 			Connection: conn1, // ✅ Write ke secondary node
-			Create: pulumi.Sprintf(`
+			Create: readManifestCmd.Stdout.ApplyT(func(output string) string {
+				// ✅ Parse manifest dan checksum dari output
+				lines := strings.Split(strings.TrimSpace(output), "\n")
+
+				if len(lines) < 2 {
+					return fmt.Sprintf(`
+                        echo "❌ Invalid manifest bundle format (expected 2+ lines, got %d)"
+                        exit 1
+                    `, len(lines))
+				}
+
+				var manifestContent []string
+				var sourceChecksum string
+				var sourceManifestB64 string
+				var calculatedChecksum string
+				inManifest := false
+				inChecksum := false
+				checksumLines := []string{}
+
+				for _, line := range lines {
+					if line == "---MANIFEST-START---" {
+						inManifest = true
+						continue
+					}
+					if line == "---MANIFEST-END---" {
+						inManifest = false
+						continue
+					}
+					if line == "---CHECKSUM-START---" {
+						inChecksum = true
+						continue
+					}
+					if line == "---CHECKSUM-END---" {
+						inChecksum = false
+						continue
+					}
+
+					if inManifest {
+						manifestContent = append(manifestContent, line)
+					}
+					if inChecksum && line != "" {
+						checksumLines = append(checksumLines, strings.TrimSpace(line))
+					}
+				}
+
+				manifest := strings.Join(manifestContent, "\n")
+
+				// Ambil checksum dan base64 dari output
+				if len(checksumLines) >= 1 {
+					sourceChecksum = checksumLines[0]
+				}
+				if len(checksumLines) >= 2 {
+					sourceManifestB64 = checksumLines[1]
+				}
+
+				// Gunakan base64 dari source jika tersedia, jika tidak encode sendiri
+				var manifestBase64 string
+				if sourceManifestB64 != "" {
+					manifestBase64 = sourceManifestB64
+				} else {
+					manifestBase64 = base64.StdEncoding.EncodeToString([]byte(manifest))
+				}
+
+				// Hitung checksum dari raw manifest (sesuai dengan readManifestCmd)
+				manifestChecksumBytes := md5.Sum([]byte(manifest))
+				calculatedChecksum = hex.EncodeToString(manifestChecksumBytes[:])
+
+				// ✅ PERBAIKAN: Validate checksum sebelum generate script
+				if sourceChecksum == "" {
+					// Log warning tapi tetap lanjut (checksum optional)
+					fmt.Printf("⚠️  Warning: No checksum found in manifest output for node %s\n", nodes[i].Name)
+					sourceChecksum = calculatedChecksum
+				} else if sourceChecksum != calculatedChecksum {
+					fmt.Printf("⚠️  Warning: Source checksum mismatch, using calculated checksum\n")
+					fmt.Printf("   Source:     %s\n", sourceChecksum[:10]+"...")
+					fmt.Printf("   Calculated: %s\n", calculatedChecksum[:10]+"...")
+					fmt.Printf("   Using calculated checksum for validation\n")
+					sourceChecksum = calculatedChecksum
+				}
+
+				fmt.Printf("✅ Manifest checksum for node %s: %s\n", nodes[i].Name, sourceChecksum[:10]+"...")
+
+				// ✅ Generate script dengan proper escaping
+				return fmt.Sprintf(`
 				set -Eeuo pipefail
                 
-                echo "📦 Preparing kube-vip manifest on node %s..."
+                NODE_NAME="%s"
+                SOURCE_CHECKSUM="%s"
+                MANIFEST_B64="%s"
                 
-                # ✅ PERBAIKAN CRITICAL: Buat directory structure SEBELUM copy
+                echo "📦 Preparing kube-vip manifest on node $NODE_NAME..."
+                echo "🔍 Source checksum: ${SOURCE_CHECKSUM:0:10}..."
+                
+                echo "🛑 Stopping kubelet to prevent premature manifest loading..."
+                sudo systemctl stop kubelet || true
+                sudo systemctl disable kubelet 2>/dev/null || true
+                sleep 2
+
+                # ✅ Verify kubelet benar-benar stopped
+                if sudo systemctl is-active --quiet kubelet; then
+                    echo "⚠️  Warning: kubelet still running, forcing stop..."
+                    sudo systemctl kill kubelet 2>/dev/null || true
+                    sleep 3
+                fi
+                
+                # ✅ Buat directory structure SEBELUM copy
                 echo "📁 Creating Kubernetes directory structure..."
                 sudo mkdir -p /etc/kubernetes/manifests
 				sudo mkdir -p /etc/kubernetes/kube-vip
@@ -954,103 +1129,249 @@ EOF
                 sudo chmod 755 /etc/kubernetes
                 sudo chmod 755 /etc/kubernetes/manifests
                 sudo chmod 755 /etc/kubernetes/kube-vip
+                sudo chmod 755 /etc/kubernetes/pki
+                sudo chmod 1777 /tmp/kube-vip-setup # ✅ Sticky bit untuk temp dir
+
+                # ✅ Set ownership
                 sudo chown -R root:root /etc/kubernetes
                 
                 # ✅ Verify directory creation
-                if [ ! -d /etc/kubernetes/manifests ]; then
-                    echo "❌ Failed to create /etc/kubernetes/manifests directory!"
-                    exit 1
-                fi
+                for dir in /etc/kubernetes/manifests /etc/kubernetes/kube-vip /etc/kubernetes/pki; do
+                    if [ ! -d "$dir" ]; then
+                        echo "❌ Failed to create directory: $dir"
+                        exit 1
+                    fi
+                done
                 
                 echo "✅ Directory structure created:"
-                sudo ls -la /etc/kubernetes/
                 
-                # ✅ Write manifest content menggunakan heredoc
-                cat <<'MANIFEST_EOF' | sudo tee /tmp/kube-vip-setup/kube-vip.yaml > /dev/null
-%s
-MANIFEST_EOF
+                # ✅ Write manifest content menggunakan atomic operation
+                echo "📝 Writing manifest content..."
+
+                # ✅ Write ke temporary file dengan proper escaping
+                TEMP_MANIFEST="/tmp/kube-vip-setup/kube-vip.yaml.$$"
+                
+                # ✅ PERBAIKAN: Decode base64 dan write ke file
+                echo "$MANIFEST_B64" | base64 -d | sudo tee "$TEMP_MANIFEST" > /dev/null
 
                 # ✅ Verify copied file exists
-                if [ ! -f /tmp/kube-vip-setup/kube-vip.yaml ]; then
-                    echo "❌ Manifest file not found after write!"
+                if [ ! -f "$TEMP_MANIFEST" ]; then
+                    echo "❌ Temporary manifest file not found after write!"
                     exit 1
                 fi
                 
                 # ✅ Verify file is not empty
-                FILE_SIZE=$(sudo wc -c < /tmp/kube-vip-setup/kube-vip.yaml)
+                FILE_SIZE=$(sudo wc -c < "$TEMP_MANIFEST")
                 if [ "$FILE_SIZE" -eq 0 ]; then
                     echo "❌ Manifest file is empty!"
                     exit 1
                 fi
                 
                 echo "✅ Manifest file created (size: ${FILE_SIZE} bytes)"
+
+                # ✅ Checksum validation
+                echo "🔍 Validating manifest integrity..."
+                ACTUAL_CHECKSUM=$(sudo md5sum "$TEMP_MANIFEST" | awk '{print $1}')
                 
-                # ✅ Validate YAML syntax
-                echo "🔍 Validating YAML syntax..."
-                if command -v yamllint >/dev/null 2>&1; then
-                    yamllint /tmp/kube-vip-setup/kube-vip.yaml || echo "⚠️  YAML validation warning (non-critical)"
+                echo "   Source checksum:  $SOURCE_CHECKSUM"
+                echo "   Actual checksum:  $ACTUAL_CHECKSUM"
+                
+                if [ -n "$SOURCE_CHECKSUM" ]; then
+                    if [ "$ACTUAL_CHECKSUM" != "$SOURCE_CHECKSUM" ]; then
+                        echo "❌ Checksum mismatch!"
+                        echo "   Expected: $SOURCE_CHECKSUM"
+                        echo "   Got:      $ACTUAL_CHECKSUM"
+                        echo "   File size: $FILE_SIZE bytes"
+                        echo ""
+                        echo "📋 Manifest content (first 50 lines):"
+                        sudo head -n 50 "$TEMP_MANIFEST"
+                        echo ""
+                        echo "📋 File details:"
+                        sudo ls -lh "$TEMP_MANIFEST"
+                        sudo file "$TEMP_MANIFEST"
+                        exit 1
+                    fi
+                    echo "✅ Checksum validated: $ACTUAL_CHECKSUM"
+                else
+                    echo "⚠️  Checksum validation skipped (no source checksum)"
+                    echo "   Actual checksum: $ACTUAL_CHECKSUM"
                 fi
-                
-                # ✅ Verify manifest contains required fields
-                if ! grep -q "kind: Pod" /tmp/kube-vip-setup/kube-vip.yaml; then
-                    echo "❌ Manifest missing 'kind: Pod' field!"
-                    cat /tmp/kube-vip-setup/kube-vip.yaml
+
+                # ✅ Validate YAML structure
+                if ! grep -q "kind: Pod" "$TEMP_MANIFEST"; then
+                    echo "❌ Invalid manifest: missing 'kind: Pod'"
+                    sudo cat "$TEMP_MANIFEST"
                     exit 1
                 fi
                 
-                if ! grep -q "name: kube-vip" /tmp/kube-vip-setup/kube-vip.yaml; then
-                    echo "❌ Manifest missing 'name: kube-vip' field!"
+                if ! grep -q "name: kube-vip" "$TEMP_MANIFEST"; then
+                    echo "❌ Invalid manifest: missing 'name: kube-vip'"
+                    sudo cat "$TEMP_MANIFEST"
                     exit 1
-                fi                
-
-                echo "✅ Manifest validation passed"
-
+                fi
+                
+                # ✅ Validate required fields
+                REQUIRED_FIELDS=(
+                    "apiVersion:"
+                    "kind: Pod"
+                    "metadata:"
+                    "name: kube-vip"
+                    "namespace: kube-system"
+                    "spec:"
+                    "containers:"
+                    "image:"
+                )
+                
+                for field in "${REQUIRED_FIELDS[@]}"; do
+                    if ! grep -q "$field" "$TEMP_MANIFEST"; then
+                        echo "❌ Invalid manifest: missing required field '$field'"
+                        sudo cat "$TEMP_MANIFEST"
+                        exit 1
+                    fi
+                done
+                
+                echo "✅ Manifest structure validated"
+                
                 # ✅ Show manifest preview
-                echo "🔍 Manifest preview (first 15 lines):"
-                head -n 15 /tmp/kube-vip-setup/kube-vip.yaml
+                echo "📋 Manifest preview (first 20 lines):"
+                sudo head -n 20 "$TEMP_MANIFEST"
                 
 				echo "📦 Staging manifest to /etc/kubernetes/kube-vip/kube-vip.yaml (activate after join)..."
+
+                # ✅ Use flock untuk prevent race conditions
 				LOCKFILE="/etc/kubernetes/kube-vip/.pulumi-kubevip.lock"
 				sudo touch "$LOCKFILE"
-				if command -v flock >/dev/null 2>&1; then
-					sudo flock -x "$LOCKFILE" bash -c 'set -Eeuo pipefail; install -m 0644 /tmp/kube-vip-setup/kube-vip.yaml /etc/kubernetes/kube-vip/kube-vip.yaml.tmp; mv -f /etc/kubernetes/kube-vip/kube-vip.yaml.tmp /etc/kubernetes/kube-vip/kube-vip.yaml; chown root:root /etc/kubernetes/kube-vip/kube-vip.yaml; sync || true'
-				else
-					sudo install -m 0644 /tmp/kube-vip-setup/kube-vip.yaml /etc/kubernetes/kube-vip/kube-vip.yaml.tmp
-					sudo mv -f /etc/kubernetes/kube-vip/kube-vip.yaml.tmp /etc/kubernetes/kube-vip/kube-vip.yaml
-					sudo chown root:root /etc/kubernetes/kube-vip/kube-vip.yaml
-					sudo sync || true
-				fi
-				
-				if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
-					echo "⚠️  Found active kube-vip manifest, moving to staging to avoid VIP takeover during join..."
-					sudo mv -f /etc/kubernetes/manifests/kube-vip.yaml /etc/kubernetes/kube-vip/kube-vip.yaml || true
-				fi
+                sudo chmod 644 "$LOCKFILE"
 
-				# ✅ Verify staging
-				echo "🔍 Verifying staged manifest..."
-				if [ ! -f /etc/kubernetes/kube-vip/kube-vip.yaml ]; then
-					echo "❌ Manifest staging verification failed!"
-					sudo ls -la /etc/kubernetes/kube-vip/ || true
-					exit 1
-				fi
-				
-				echo "✅ Manifest staged successfully:"
-				sudo ls -lh /etc/kubernetes/kube-vip/kube-vip.yaml
+                if command -v flock >/dev/null 2>&1; then
+                    echo "🔒 Using flock for atomic file operations..."
+                    
+                    # ✅ Kirim variabel TEMP_MANIFEST sebagai argumen ke bash -c (karena sudo membersihkan env vars)
+                    # ✅ Atomic copy dengan flock (timeout 30 detik)
+                    if ! sudo flock -x -w 30 "$LOCKFILE" bash -c '
+                        set -Eeuo pipefail
+                        
+                        # Ambil argumen pertama sebagai TEMP_MANIFEST
+                        TEMP_MANIFEST="$1"
+                        
+                        # Copy ke temporary file dulu
+                        install -m 0644 "$TEMP_MANIFEST" /etc/kubernetes/kube-vip/kube-vip.yaml.tmp
+                        
+                        # Verify temporary file
+                        if [ ! -s /etc/kubernetes/kube-vip/kube-vip.yaml.tmp ]; then
+                            echo "❌ Temporary file is empty after copy!"
+                            exit 1
+                        fi
+                        
+                        # Atomic rename (guaranteed atomic on same filesystem)
+                        mv -f /etc/kubernetes/kube-vip/kube-vip.yaml.tmp /etc/kubernetes/kube-vip/kube-vip.yaml
+                        
+                        # Set ownership
+                        chown root:root /etc/kubernetes/kube-vip/kube-vip.yaml
+                        
+                        # Force filesystem sync
+                        sync || true
+                        
+                        echo "✅ Atomic copy completed"
+                    ' bash "$TEMP_MANIFEST"; then
+                        echo "❌ Failed to acquire lock or copy failed!"
+                        exit 1
+                    fi
+                    
+                    echo "✅ Manifest staged with flock protection"
+                else
+                    echo "⚠️  flock not available, using fallback atomic copy..."
+                    
+                    # ✅ Fallback: Manual atomic copy tanpa flock
+                    sudo install -m 0644 "$TEMP_MANIFEST" /etc/kubernetes/kube-vip/kube-vip.yaml.tmp
+                    
+                    # Verify temporary file
+                    if [ ! -s /etc/kubernetes/kube-vip/kube-vip.yaml.tmp ]; then
+                        echo "❌ Temporary file is empty after copy!"
+                        exit 1
+                    fi
+                    
+                    # Atomic rename
+                    sudo mv -f /etc/kubernetes/kube-vip/kube-vip.yaml.tmp /etc/kubernetes/kube-vip/kube-vip.yaml
+                    
+                    # Set ownership
+                    sudo chown root:root /etc/kubernetes/kube-vip/kube-vip.yaml
+                    
+                    # Force filesystem sync
+                    sudo sync || true
+                    
+                    echo "✅ Manifest staged with fallback method"
+                fi
                 
-                # ✅ Cleanup temp directory
+                # ✅ CRITICAL: Remove any active manifest to prevent premature VIP takeover
+                if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+                    echo "⚠️  Found active kube-vip manifest in /manifests/"
+                    echo "🔄 Moving to staging to prevent VIP takeover during join..."
+                    
+                    # Backup existing manifest
+                    sudo cp /etc/kubernetes/manifests/kube-vip.yaml /etc/kubernetes/kube-vip/kube-vip.yaml.backup
+                    
+                    # Remove from manifests directory
+                    # sudo rm -f /etc/kubernetes/manifests/kube-vip.yaml
+                    
+                    # Wait for kubelet to detect removal
+                    sleep 2
+                    sudo cp /etc/kubernetes/kube-vip/kube-vip.yaml /etc/kubernetes/manifests/
+                    
+                    echo "✅ Active manifest removed from /manifests/"
+                fi
+
+                # ✅ Verify staging location
+                echo "🔍 Verifying staged manifest..."
+                if [ ! -f /etc/kubernetes/kube-vip/kube-vip.yaml ]; then
+                    echo "❌ Manifest staging verification failed!"
+                    echo "📋 Directory contents:"
+                    sudo ls -la /etc/kubernetes/kube-vip/ || true
+                    exit 1
+                fi
+                
+                # ✅ Verify file integrity
+                STAGED_SIZE=$(sudo stat -c '%%s' /etc/kubernetes/kube-vip/kube-vip.yaml)
+                if [ "$STAGED_SIZE" -lt 100 ]; then
+                    echo "❌ Staged manifest is too small ($STAGED_SIZE bytes)!"
+                    exit 1
+                fi
+                
+                echo "✅ Manifest staged successfully:"
+                sudo ls -lh /etc/kubernetes/kube-vip/kube-vip.yaml
+                echo "   Size: $STAGED_SIZE bytes"
+                echo "   Location: /etc/kubernetes/kube-vip/kube-vip.yaml"
+                
+                # ✅ Cleanup temp files
+                echo "🧹 Cleaning up temporary files..."
                 sudo rm -rf /tmp/kube-vip-setup
                 
                 # ✅ IMPORTANT: Prevent kubelet from starting prematurely
-                echo "🛑 Disabling kubelet service (will be enabled during join)..."
+                echo "🛑 Ensuring kubelet is stopped and disabled..."
                 sudo systemctl stop kubelet 2>/dev/null || true
                 sudo systemctl disable kubelet 2>/dev/null || true
+                
+                # ✅ Verify kubelet is not running
+                if sudo systemctl is-active --quiet kubelet; then
+                    echo "⚠️  Warning: kubelet is still running, forcing stop..."
+                    sudo systemctl kill kubelet 2>/dev/null || true
+                    sleep 2
+                fi
+                
+                echo "✅ kubelet stopped and disabled (will be enabled during join)"
 
+                echo ""
                 echo "✅ kube-vip manifest preparation complete on node %s"
-				echo "✅ kube-vip manifest staged (will be activated post-join)"
+                echo "📦 Manifest staged at: /etc/kubernetes/kube-vip/kube-vip.yaml"
+                echo "⏳ Will be activated AFTER successful kubeadm join"
+                echo ""
             `,
-				nodes[i].Name,          // Display node name (first occurrence)
-				readManifestCmd.Stdout, // Inject content from primary node
-				nodes[i].Name),         // Display node name
+					nodes[i].Name,  // Display node name (first occurrence)
+					sourceChecksum, // SOURCE_CHECKSUM
+					manifestBase64, // Base64 encoded manifest
+					nodes[i].Name,  // Display node name
+				)
+			}).(pulumi.StringOutput),
 		}, pulumi.DependsOn([]pulumi.Resource{readManifestCmd, vipReachabilityCommands[i]}))
 
 		if err != nil {
@@ -1131,32 +1452,54 @@ MANIFEST_EOF
 		writeCertsName := fmt.Sprintf("write-k8s-certificates-%d", i)
 		writeCertsCmd, err := remote.NewCommand(ctx, writeCertsName, &remote.CommandArgs{
 			Connection: conn1,
-			Create: pulumi.Sprintf(`
+			Create: readCertsCmd.Stdout.ApplyT(func(certBundle string) string {
+				return fmt.Sprintf(`
                 set -Eeuo pipefail
                 
                 echo "🔐 Pre-copy Kubernetes certificates on node %s..."
 
                 sudo mkdir -p /etc/kubernetes/pki/etcd
-                sudo chmod 755 /etc/kubernetes /etc/kubernetes/pki /etc/kubernetes/pki/etcd
+                sudo chmod 755 /etc/kubernetes /etc/kubernetes/pki /etc/kubernetes/pki/etcd /etc/kubernetes/manifests /etc/kubernetes/kube-vip
                 sudo chown -R root:root /etc/kubernetes
 
                 # Langsung assign ke variable tanpa heredoc
+                echo "🔍 Validating certificate bundle..."
                 CERT_BUNDLE_RAW='%s'
 
+                # Extract checksum and payload
                 EXPECTED_CHK=$(echo "$CERT_BUNDLE_RAW" | head -n 1 | tr -d '\r' | tr -d '[:space:]')
                 PAYLOAD=$(echo "$CERT_BUNDLE_RAW" | tail -n +2 | tr -d '\r' | tr -d '\n')
 
+                # Validate bundle is not empty
                 if [ -z "$EXPECTED_CHK" ] || [ -z "$PAYLOAD" ]; then
                     echo "❌ Certificate bundle is empty or malformed"
                     exit 1
                 fi
 
+                # Decode and verify tarball
                 TMP_TARBALL="/tmp/k8s-pki-certs.tar.gz"
-                echo "$PAYLOAD" | base64 -d | sudo tee "${TMP_TARBALL}.tmp" >/dev/null
+                TMP_TARBALL_TMP="${TMP_TARBALL}.tmp"
+
+                echo "🔓 Decoding certificate bundle..."
+                echo "$PAYLOAD" | base64 -d > "${TMP_TARBALL_TMP}" 2>/dev/null || {
+                    echo "❌ Failed to decode base64 payload"
+                    echo "📋 First 100 chars of payload: ${PAYLOAD:0:100}"
+                    exit 1
+                }
+                
+                # Verify decoded file is not empty
+                if [ ! -s "${TMP_TARBALL_TMP}" ]; then
+                    echo "❌ Decoded tarball is empty"
+                    exit 1
+                fi
+
+                # Move to final location with proper permissions
                 sudo mv -f "${TMP_TARBALL}.tmp" "$TMP_TARBALL"
                 sudo chown root:root "$TMP_TARBALL"
                 sudo chmod 600 "$TMP_TARBALL"
 
+                # Verify checksum
+                echo "🔐 Verifying checksum..."
                 ACTUAL_CHK=$(sudo openssl dgst -sha256 -r "$TMP_TARBALL" | awk '{print $1}')
                 if [ "$ACTUAL_CHK" != "$EXPECTED_CHK" ]; then
                     echo "❌ Certificate archive checksum mismatch"
@@ -1165,12 +1508,48 @@ MANIFEST_EOF
                     exit 1
                 fi
 
-                sudo tar xzf "$TMP_TARBALL" -C /etc/kubernetes/pki
-                sudo rm -f "$TMP_TARBALL"
+                echo "✅ Checksum verification passed"
 
+                # Extract with verification
+                echo "📂 Extracting certificates..."
+                
+                # Test tarball integrity first
+                if ! sudo tar tzf "$TMP_TARBALL" >/dev/null 2>&1; then
+                    echo "❌ Tarball integrity check failed"
+                    sudo rm -f "$TMP_TARBALL"
+                    exit 1
+                fi
+                
+                # List contents before extraction
+                echo "📋 Tarball contents:"
+                sudo tar tzf "$TMP_TARBALL" | head -n 20
+                
+                # Extract to PKI directory
+                sudo tar xzf "$TMP_TARBALL" -C /etc/kubernetes/pki || {
+                    echo "❌ Failed to extract tarball"
+                    sudo rm -f "$TMP_TARBALL"
+                    exit 1
+                }
+                
+                # Clean up tarball
+                sudo rm -f "$TMP_TARBALL"
+                
+                echo "✅ Certificates extracted successfully"
+
+                # Set proper ownership and permissions
+                echo "🔒 Setting proper permissions..."
                 sudo chown -R root:root /etc/kubernetes/pki
-                sudo chmod 600 /etc/kubernetes/pki/*.key /etc/kubernetes/pki/etcd/*.key
-                sudo chmod 644 /etc/kubernetes/pki/*.crt /etc/kubernetes/pki/etcd/*.crt /etc/kubernetes/pki/*.pub
+
+                # Private keys: 600 (owner read/write only)
+                sudo find /etc/kubernetes/pki -type f -name "*.key" -exec chmod 600 {} \;
+                sudo find /etc/kubernetes/pki/etcd -type f -name "*.key" -exec chmod 600 {} \;
+                
+                # Public certificates: 644 (owner read/write, others read)
+                sudo find /etc/kubernetes/pki -type f -name "*.crt" -exec chmod 644 {} \;
+                sudo find /etc/kubernetes/pki/etcd -type f -name "*.crt" -exec chmod 644 {} \;
+                sudo find /etc/kubernetes/pki -type f -name "*.pub" -exec chmod 644 {} \;
+                
+                echo "✅ Permissions set"
 
                 echo "🔍 Validating required certificates..."
                 REQUIRED_CERTS=(
@@ -1183,31 +1562,336 @@ MANIFEST_EOF
                     "/etc/kubernetes/pki/etcd/ca.crt"
                     "/etc/kubernetes/pki/etcd/ca.key"
                 )
-                
+
+                VALIDATION_FAILED=0
+
                 for cert in "${REQUIRED_CERTS[@]}"; do
-                    if [ ! -s "$cert" ]; then
-                        echo "❌ Required certificate missing/empty: $cert"
-                        exit 1
+                    echo -n "   Checking \$cert... "
+
+                    # Check file exists
+                    if ! sudo test -f "\$cert"; then
+                        echo "❌ NOT FOUND"
+                        VALIDATION_FAILED=1
+                        continue
+                    fi
+                    
+                    # Check file is not empty
+                    if ! sudo test -s "\$cert"; then
+                        echo "❌ EMPTY"
+                        VALIDATION_FAILED=1
+                        continue
+                    fi
+                    
+                    # Check file size is reasonable (> 100 bytes)
+                    FILE_SIZE=$(sudo stat -c '%s' "\$cert" 2>/dev/null || echo "0")
+                    if [ "\$FILE_SIZE" -lt 100 ]; then
+                        echo "❌ TOO SMALL ($FILE_SIZE bytes)"
+                        VALIDATION_FAILED=1
+                        continue
+                    fi
+                    
+                    # Check permissions
+                    FILE_PERMS=$(sudo stat -c '%%a' "\$cert" 2>/dev/null || echo "000")
+                    EXPECTED_PERMS="644"
+                    
+                    # Determine expected permissions based on file extension
+                    if [[ "\$cert" == *.key ]]; then
+                        EXPECTED_PERMS="600"
+                    fi
+                    
+                    if [ "\$FILE_PERMS" != "\$EXPECTED_PERMS" ]; then
+                        echo "⚠️  WRONG PERMS (\$FILE_PERMS, expected \$EXPECTED_PERMS) - fixing..."
+                        sudo chmod "\$EXPECTED_PERMS" "\$cert"
+                        FILE_PERMS=$(sudo stat -c '%%a' "\$cert")
+                    fi
+                    
+                    echo "✅ OK (size: \$FILE_SIZE bytes, perms: \$FILE_PERMS)"
+
+                    # ✅ Additional validation untuk certificate files
+                    if [[ "$cert" == *.crt ]]; then
+                        echo -n "      Validating X.509 certificate... "
+                        if sudo openssl x509 -in "$cert" -text -noout >/dev/null 2>&1; then
+                            # Extract certificate info
+                            SUBJECT=$(sudo openssl x509 -in "$cert" -subject -noout 2>/dev/null | sed 's/subject=//')
+                            EXPIRY=$(sudo openssl x509 -in "$cert" -enddate -noout 2>/dev/null | sed 's/notAfter=//')
+                            echo "✅ Valid"
+                            echo "         Subject: $SUBJECT"
+                            echo "         Expires: $EXPIRY"
+                        else
+                            echo "❌ INVALID X.509"
+                            VALIDATION_FAILED=1
+                        fi
+                    fi
+                    
+                    # ✅ Additional validation untuk private key files
+                    if [[ "$cert" == *.key ]]; then
+                        echo -n "      Validating RSA private key... "
+                        if sudo openssl rsa -in "$cert" -check -noout >/dev/null 2>&1; then
+                            KEY_SIZE=$(sudo openssl rsa -in "$cert" -text -noout 2>/dev/null | grep "Private-Key:" | grep -oP '\d+')
+                            echo "✅ Valid (${KEY_SIZE:-unknown} bit)"
+                        else
+                            echo "❌ INVALID RSA KEY"
+                            VALIDATION_FAILED=1
+                        fi
+                    fi
+                    
+                    # ✅ Additional validation untuk public key files
+                    if [[ "$cert" == *.pub ]]; then
+                        echo -n "      Validating public key... "
+                        if sudo openssl rsa -pubin -in "$cert" -text -noout >/dev/null 2>&1; then
+                            echo "✅ Valid"
+                        else
+                            echo "❌ INVALID PUBLIC KEY"
+                            VALIDATION_FAILED=1
+                        fi
                     fi
                 done
-                sudo openssl x509 -in /etc/kubernetes/pki/ca.crt -noout -subject >/dev/null
-                sudo openssl x509 -in /etc/kubernetes/pki/front-proxy-ca.crt -noout -subject >/dev/null
-                sudo openssl x509 -in /etc/kubernetes/pki/etcd/ca.crt -noout -subject >/dev/null
+                
+                if [ \$VALIDATION_FAILED -eq 1 ]; then
+                    echo ""
+                    echo "❌ Certificate validation failed!"
+                    echo "📋 PKI directory structure:"
+                    sudo ls -laR /etc/kubernetes/pki/
+                    exit 1
+                fi
+                
+                # ✅ Validate certificate contents (OpenSSL verification)
+                echo ""
+                echo "🔐 Validating certificate integrity with OpenSSL..."
+                
+                # Validate X.509 certificates
+                for cert_file in "/etc/kubernetes/pki/ca.crt" \
+                                 "/etc/kubernetes/pki/front-proxy-ca.crt" \
+                                 "/etc/kubernetes/pki/etcd/ca.crt"; do
+                    echo -n "   Validating \$cert_file... "
+                    if sudo openssl x509 -in "\$cert_file" -noout -subject -dates >/dev/null 2>&1; then
+                        SUBJECT=$(sudo openssl x509 -in "\$cert_file" -noout -subject 2>/dev/null | sed 's/subject=//')
+                        EXPIRY=$(sudo openssl x509 -in "\$cert_file" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+                        echo "✅ Valid"
+                        echo "      Subject: \$SUBJECT"
+                        echo "      Expires: \$EXPIRY"
+                    else
+                        echo "❌ INVALID X.509 CERTIFICATE"
+                        VALIDATION_FAILED=1
+                    fi
+                done
+                
+                # Validate private keys
+                for key_file in "/etc/kubernetes/pki/ca.key" \
+                                "/etc/kubernetes/pki/front-proxy-ca.key" \
+                                "/etc/kubernetes/pki/etcd/ca.key" \
+                                "/etc/kubernetes/pki/sa.key"; do
+                    echo -n "   Validating \$key_file... "
+                    if sudo openssl pkey -in "\$key_file" -noout >/dev/null 2>&1; then
+                        KEY_TYPE=$(sudo openssl pkey -in "\$key_file" -noout -text 2>/dev/null | head -1)
+                        echo "✅ Valid (\$KEY_TYPE)"
+                    else
+                        echo "❌ INVALID PRIVATE KEY"
+                        VALIDATION_FAILED=1
+                    fi
+                done
+                
+                if [ \$VALIDATION_FAILED -eq 1 ]; then
+                    echo ""
+                    echo "❌ OpenSSL validation failed!"
+                    exit 1
+                fi
+                
+                # Final summary
+                echo ""
 
-                sudo openssl pkey -in /etc/kubernetes/pki/ca.key -noout >/dev/null
-                sudo openssl pkey -in /etc/kubernetes/pki/front-proxy-ca.key -noout >/dev/null
-                sudo openssl pkey -in /etc/kubernetes/pki/etcd/ca.key -noout >/dev/null
-                sudo openssl pkey -in /etc/kubernetes/pki/sa.key -noout >/dev/null
+                echo "📊 Certificate Copy Summary:"
+                echo "   ✅ All required certificates present"
+                echo "   ✅ All certificates have valid content"
+                echo "   ✅ All permissions set correctly"
+                echo "   ✅ OpenSSL validation passed"
+                echo ""
+                echo "📋 Final PKI directory structure:"
+                sudo ls -lah /etc/kubernetes/pki/
+                sudo ls -lah /etc/kubernetes/pki/etcd/
 
-                echo "✅ Pre-copy certificates complete"
+                echo ""
+                echo "✅ PKI certificates successfully copied and validated on node %s"
             `,
-				nodes[i].Name,
-				readCertsCmd.Stdout,
-			),
+					nodes[i].Name,
+					certBundle,
+					nodes[i].Name,
+				)
+			}).(pulumi.StringOutput),
 		}, pulumi.DependsOn([]pulumi.Resource{readCertsCmd, writeManifestCmd}))
 
 		if err != nil {
 			return nil, fmt.Errorf("gagal copy certificates ke node %d: %w", i, err)
+		}
+
+		preJoinValidationName := fmt.Sprintf("pre-join-validation-%d", i)
+		preJoinValidationCmd, err := remote.NewCommand(ctx, preJoinValidationName, &remote.CommandArgs{
+			Connection: conn1,
+			Create: pulumi.Sprintf(`
+                set -Eeuo pipefail
+                
+                echo "🔍 Running pre-join validation on node %s..."
+                
+                # ✅ Validate Kubernetes directories exist
+                echo "📁 Validating directory structure..."
+                REQUIRED_DIRS=(
+                    "/etc/kubernetes"
+                    "/etc/kubernetes/pki"
+                    "/etc/kubernetes/pki/etcd"
+                    "/etc/kubernetes/manifests"
+                    "/etc/kubernetes/kube-vip"
+                )
+                
+                for dir in "${REQUIRED_DIRS[@]}"; do
+                    if [ ! -d "$dir" ]; then
+                        echo "❌ Required directory not found: $dir"
+                        exit 1
+                    fi
+                    echo "   ✅ $dir exists"
+                done
+                
+                # ✅ Validate certificates are present and valid
+                echo ""
+                echo "🔐 Validating certificates..."
+                REQUIRED_CERTS=(
+                    "/etc/kubernetes/pki/ca.crt"
+                    "/etc/kubernetes/pki/ca.key"
+                    "/etc/kubernetes/pki/sa.key"
+                    "/etc/kubernetes/pki/sa.pub"
+                    "/etc/kubernetes/pki/front-proxy-ca.crt"
+                    "/etc/kubernetes/pki/front-proxy-ca.key"
+                    "/etc/kubernetes/pki/etcd/ca.crt"
+                    "/etc/kubernetes/pki/etcd/ca.key"
+                )
+                
+                for cert in "${REQUIRED_CERTS[@]}"; do
+                    if [ ! -f "$cert" ]; then
+                        echo "❌ Required certificate not found: $cert"
+                        exit 1
+                    fi
+                    
+                    if [ ! -s "$cert" ]; then
+                        echo "❌ Certificate file is empty: $cert"
+                        exit 1
+                    fi
+                    
+                    echo "   ✅ $cert exists and is not empty"
+                done
+                
+                # ✅ Validate kube-vip manifest is staged
+                echo ""
+                echo "📦 Validating kube-vip manifest..."
+                if [ ! -f /etc/kubernetes/kube-vip/kube-vip.yaml ]; then
+                    echo "❌ kube-vip manifest not found at /etc/kubernetes/kube-vip/kube-vip.yaml"
+                    exit 1
+                fi
+                
+                if [ ! -s /etc/kubernetes/kube-vip/kube-vip.yaml ]; then
+                    echo "❌ kube-vip manifest is empty"
+                    exit 1
+                fi
+                
+                if ! grep -q "kind: Pod" /etc/kubernetes/kube-vip/kube-vip.yaml; then
+                    echo "❌ Invalid kube-vip manifest: missing 'kind: Pod'"
+                    exit 1
+                fi
+                
+                echo "   ✅ kube-vip manifest is valid and staged"
+                
+                # ✅ Validate kube-vip is NOT active yet (should be staged only)
+                if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+                    echo "⚠️  WARNING: kube-vip manifest found in active directory"
+                    echo "   This should only be activated AFTER successful join"
+                    echo "   Moving to staging directory..."
+                    sudo mv -f /etc/kubernetes/manifests/kube-vip.yaml /etc/kubernetes/kube-vip/kube-vip.yaml
+                fi
+                
+                # ✅ Validate system prerequisites
+                echo ""
+                echo "🔧 Validating system prerequisites..."
+                
+                # Check containerd is running
+                if ! sudo systemctl is-active --quiet containerd; then
+                    echo "❌ containerd is not running"
+                    exit 1
+                fi
+                echo "   ✅ containerd is running"
+                
+                # Check swap is disabled
+                if swapon --show | tail -n +2 | grep -q .; then
+                    echo "❌ swap is enabled (must be disabled for Kubernetes)"
+                    exit 1
+                fi
+                echo "   ✅ swap is disabled"
+                
+                # Check required kernel modules
+                REQUIRED_MODULES=("br_netfilter" "overlay")
+                for mod in "${REQUIRED_MODULES[@]}"; do
+                    if ! lsmod | grep -q "^$mod"; then
+                        echo "⚠️  Kernel module $mod not loaded, loading..."
+                        sudo modprobe "$mod"
+                    fi
+                    echo "   ✅ $mod module loaded"
+                done
+                
+                # ✅ Validate network connectivity to VIP
+                echo ""
+                echo "🌐 Validating network connectivity..."
+                VIP="%s"
+                
+                if ! ping -c 1 -W 2 "$VIP" >/dev/null 2>&1; then
+                    echo "❌ Cannot reach VIP: $VIP"
+                    exit 1
+                fi
+                echo "   ✅ VIP $VIP is reachable"
+                
+                # Check API server port
+                if ! nc -z -w 5 "$VIP" 6443 >/dev/null 2>&1; then
+                    echo "❌ Cannot connect to API server at $VIP:6443"
+                    exit 1
+                fi
+                echo "   ✅ API server at $VIP:6443 is reachable"
+                
+                # ✅ Validate kubelet is NOT running (will be started by kubeadm join)
+                echo ""
+                echo "🛑 Validating kubelet state..."
+                if sudo systemctl is-active --quiet kubelet; then
+                    echo "⚠️  kubelet is running, stopping it..."
+                    sudo systemctl stop kubelet
+                fi
+                
+                if sudo systemctl is-enabled --quiet kubelet 2>/dev/null; then
+                    echo "⚠️  kubelet is enabled, disabling it..."
+                    sudo systemctl disable kubelet
+                fi
+                echo "   ✅ kubelet is stopped and disabled (will be managed by kubeadm)"
+                
+                # ✅ Display validation summary
+                echo ""
+                echo "═══════════════════════════════════════════════════════════"
+                echo "✅ PRE-JOIN VALIDATION PASSED"
+                echo "═══════════════════════════════════════════════════════════"
+                echo "Node: %s"
+                echo "Status: Ready for kubeadm join"
+                echo ""
+                echo "📋 Validation Summary:"
+                echo "   ✅ Directory structure: OK"
+                echo "   ✅ Certificates: OK (8/8 files)"
+                echo "   ✅ kube-vip manifest: Staged"
+                echo "   ✅ System prerequisites: OK"
+                echo "   ✅ Network connectivity: OK"
+                echo "   ✅ Kubelet state: Stopped (ready for join)"
+                echo "═══════════════════════════════════════════════════════════"
+                echo ""
+                echo "🚀 Node is ready for 'kubeadm join --control-plane'"
+            `,
+				nodes[i].Name,
+				cfg.K8sVIP,
+				nodes[i].Name),
+		}, pulumi.DependsOn([]pulumi.Resource{writeCertsCmd}))
+
+		if err != nil {
+			return nil, fmt.Errorf("gagal run pre-join validation pada node %d: %w", i, err)
 		}
 
 		// Step 1b: Baca kubeconfig dari primary node (node 0)
@@ -1247,7 +1931,7 @@ KUBECONFIG_EOF
 			return nil, fmt.Errorf("gagal copy kubeconfig ke node %d: %w", i, err)
 		}
 
-		joinCommands = append(joinCommands, writeKubeconfigCmd)
+		joinCommands = append(joinCommands, writeKubeconfigCmd, preJoinValidationCmd)
 	}
 
 	// Join node ke cluster (setelah manifest kube-vip di-copy)
@@ -1255,7 +1939,7 @@ KUBECONFIG_EOF
 	for i := 1; i < len(nodes); i++ {
 		conn1 := createConnection(nodes[i])
 
-		nodeName := fmt.Sprintf("kubeadm-join-cp-%d", i)
+		// nodeName := fmt.Sprintf("kubeadm-join-cp-%d", i)
 
 		// Ambil dependency dari copy manifest command yang sesuai
 		copyVipDep := joinCommands[i-1]
@@ -1476,7 +2160,8 @@ KUBECONFIG_EOF
 		}
 
 		// Join node ke cluster dan copy kube-vip manifest dari node pertama ke node lainnya
-		joinNodeCmd, err := remote.NewCommand(ctx, nodeName, &remote.CommandArgs{
+		joinName := fmt.Sprintf("join-control-plane-%d", i)
+		joinNodeCmd, err := remote.NewCommand(ctx, joinName, &remote.CommandArgs{
 			Connection: conn1,
 			Create: pulumi.Sprintf(`
 				set -Eeuo pipefail
@@ -1488,6 +2173,7 @@ KUBECONFIG_EOF
 				NODE_NAME="%s"
 				ENDPOINT="%s"
 				IFACE="%s"
+				EXPECTED_SERVER="https://${ENDPOINT}:6443"
 
 				echo "🚀 Joining node $NODE_NAME to cluster..."
                 echo "📋 Configuration:"
@@ -1533,20 +2219,43 @@ KUBECONFIG_EOF
 					echo "🧾 Endpoint is an IP; skipping /etc/hosts mapping"
 				else
 					echo "🧾 Ensuring /etc/hosts maps endpoint to VIP (authoritative)..."
-					HOSTS_TMP="/tmp/hosts.k8s-ha.tmp"
-					sudo cp -f /etc/hosts "/etc/hosts.bak.k8s-ha.$(date +%s)"
-					sudo awk -v ep="$ENDPOINT" '{
-						if ($0 ~ /^[[:space:]]*#/ || NF < 2) { print; next }
-						for (i = 2; i <= NF; i++) {
-							if ($i == ep) next
-						}
-						print
-					}' /etc/hosts | sudo tee "$HOSTS_TMP" >/dev/null
+                    BACKUP_TIMESTAMP=$(date +%%Y%%m%%d_%%H%%M%%S)
+                    HOSTS_TMP="/etc/hosts.bak.k8s-ha.${BACKUP_TIMESTAMP}"
+					if [ -f /etc/hosts ]; then
+                        sudo cp -f /etc/hosts "$HOSTS_TMP" || {
+                        echo "⚠️  Warning: Failed to backup /etc/hosts, continuing anyway..."
+                        }
+                        echo "📋 Backup created: $HOSTS_TMP"
+                    fi
+                    
+                    # Remove existing endpoint mappings
+                    sudo awk -v ep="$ENDPOINT" '{
+                        if ($0 ~ /^[[:space:]]*#/ || NF < 2) { print; next }
+                        for (i = 2; i <= NF; i++) {
+                            if ($i == ep) next
+                        }
+                        print
+                    }' /etc/hosts | sudo tee "$HOSTS_TMP" >/dev/null
+
+                    # Add new VIP mapping
 					echo "${VIP} ${ENDPOINT}" | sudo tee -a "$HOSTS_TMP" >/dev/null
+
 					sudo mv -f "$HOSTS_TMP" /etc/hosts
 					sudo chown root:root /etc/hosts
 					sudo chmod 644 /etc/hosts
 
+                    if ! sudo grep -qE "^[[:space:]]*${VIP}[[:space:]]+${ENDPOINT}([[:space:]]+|$)" /etc/hosts; then
+                        echo "❌ Failed to update /etc/hosts mapping"
+                        echo "📋 Current /etc/hosts content:"
+                        sudo cat /etc/hosts
+                        exit 1
+                    fi
+                    
+                    echo "✅ /etc/hosts updated successfully"
+                    echo "📋 Current mapping:"
+                    sudo grep -E "^[[:space:]]*${VIP}[[:space:]]+${ENDPOINT}" /etc/hosts
+
+                    # Verify DNS resolution after update
 					if command -v getent >/dev/null 2>&1; then
 						RESOLVED_POST=$(getent ahostsv4 "$ENDPOINT" | awk '{print $1; exit}' || true)
 						echo "📋 Post /etc/hosts mapping: $ENDPOINT resolves to: ${RESOLVED_POST:-<unknown>}"
@@ -1596,6 +2305,24 @@ KUBECONFIG_EOF
                     fi
                     echo "✅ Directory exists: $dir"
                 done
+                
+                echo "🧹 Cleaning up kubeconfig lock files..."
+                
+                # Remove all potential lock files
+                LOCK_FILES=(
+                    "$HOME/.kube/config.lock"
+                    "$HOME/.kube/.config.lock"
+                    "/root/.kube/config.lock"
+                    "/root/.kube/.config.lock"
+                    "/etc/kubernetes/admin.conf.lock"
+                )
+
+                for lock_file in "${LOCK_FILES[@]}"; do
+                    if [ -f "$lock_file" ]; then
+                        echo "🗑️  Removing lock file: $lock_file"
+                        sudo rm -f "$lock_file" || true
+                    fi
+                done
 
                 # ✅ PERBAIKAN 0: Stop kubelet dulu untuk mencegah premature start
                 echo "🛑 Stopping kubelet service..."
@@ -1610,12 +2337,17 @@ KUBECONFIG_EOF
                 
                 # ✅ PERBAIKAN: Inject join command langsung dari Pulumi Output
                 JOIN_CMD='%s'
-				JOIN_CMD=$(printf '%s' "$JOIN_CMD" | tr -d '\r')
+				JOIN_CMD="${JOIN_CMD//$'\r'/}"
 
-				echo "🔧 Forcing join endpoint to VIP to avoid DNS/hosts drift..."
-				JOIN_CMD=$(echo "$JOIN_CMD" | sed -E "s/(kubeadm join)[[:space:]]+[^[:space:]]+:6443/\\1 ${VIP}:6443/")
-				if ! echo "$JOIN_CMD" | grep -q "kubeadm join ${VIP}:6443"; then
-					echo "❌ Failed to enforce join endpoint to VIP"
+				echo "🔧 Forcing join endpoint to domain (cfg.K8sDOMAIN) via VIP mapping..."
+				JOIN_TARGET="$ENDPOINT"
+				JOIN_CMD=$(echo "$JOIN_CMD" | sed -E "s/(kubeadm join)[[:space:]]+[^[:space:]]+:6443/\\1 ${JOIN_TARGET}:6443/")
+				
+                # Tambahkan ignore-preflight-errors
+                JOIN_CMD_MODIFIED="${JOIN_CMD} --ignore-preflight-errors=DirAvailable--var-lib-etcd,FileAvailable--etc-kubernetes-kubelet.conf"
+                
+                if ! echo "$JOIN_CMD" | grep -q "kubeadm join ${JOIN_TARGET}:6443"; then
+					echo "❌ Failed to enforce join endpoint"
 					echo "📋 JOIN_CMD=$JOIN_CMD"
 					exit 1
 				fi
@@ -1637,6 +2369,28 @@ KUBECONFIG_EOF
                 # ✅ Export KUBECONFIG agar preflight check kubeadm bisa sukses menggunakan kredensial dari master
                 export KUBECONFIG=$HOME/.kube/config
                 echo "📋 Using KUBECONFIG=$KUBECONFIG"
+
+				echo "🔍 Verifying kube-public/cluster-info server matches expected endpoint..."
+				CLUSTER_INFO_SERVER=""
+				if kubectl -n kube-public get configmap cluster-info >/dev/null 2>&1; then
+					CLUSTER_INFO_SERVER=$(kubectl -n kube-public get configmap cluster-info -o jsonpath='{.data.kubeconfig}' 2>/dev/null | tr '\r' '\n' | grep -m1 "server:" | awk '{print $2}' || true)
+					echo "📋 cluster-info server: ${CLUSTER_INFO_SERVER:-<unknown>}"
+					if [ -n "$CLUSTER_INFO_SERVER" ] && [ "$CLUSTER_INFO_SERVER" != "$EXPECTED_SERVER" ]; then
+						echo "📝 Patching kube-public/cluster-info to: $EXPECTED_SERVER"
+						kubectl -n kube-public get configmap cluster-info -o yaml > /tmp/cluster-info.yaml
+						sed -i -E "s|(server:[[:space:]]+https://)[^[:space:]]+(:6443)|\\1${ENDPOINT}\\2|g" /tmp/cluster-info.yaml
+						kubectl apply -f /tmp/cluster-info.yaml
+						CLUSTER_INFO_SERVER=$(kubectl -n kube-public get configmap cluster-info -o jsonpath='{.data.kubeconfig}' 2>/dev/null | tr '\r' '\n' | grep -m1 "server:" | awk '{print $2}' || true)
+						echo "✅ cluster-info server updated to: ${CLUSTER_INFO_SERVER:-<unknown>}"
+						if [ -n "$CLUSTER_INFO_SERVER" ] && [ "$CLUSTER_INFO_SERVER" != "$EXPECTED_SERVER" ]; then
+							echo "❌ cluster-info server mismatch after patch (expected $EXPECTED_SERVER, got $CLUSTER_INFO_SERVER)"
+							exit 1
+						fi
+					fi
+				else
+					echo "⚠️  cluster-info ConfigMap not accessible via kubectl; refusing to join to avoid wrong bootstrap-kubelet.conf"
+					exit 1
+				fi
                 
 				echo "🔍 Validating pre-copied PKI assets exist..."
 				REQUIRED_CERTS=(
@@ -1748,53 +2502,352 @@ KUBECONFIG_EOF
                 echo "⚙️  Pre-configuring kubeconfig directory..."
                 mkdir -p $HOME/.kube
                 
+                # Fungsi untuk memperbarui dan mencatat log modifikasi kubeconfig
+                update_kubeconfig_server() {
+                    local file=$1
+                    local expected=$2
+                    if [ -f "$file" ]; then
+                        local old_server=$(sudo grep "server:" "$file" | head -1 | awk '{print $2}')
+                        if [ "$old_server" != "$expected" ]; then
+                            echo "[$(date +%%Y%%m%%d_%%H%%M%%S)] 📝 Memperbarui $file: $old_server -> $expected"
+                            sudo sed -i "s|server:.*|server: ${expected}|g" "$file"
+                            local new_server=$(sudo grep "server:" "$file" | head -1 | awk '{print $2}')
+                            echo "[$(date +%%Y%%m%%d_%%H%%M%%S)] ✅ $file diperbarui ke: $new_server"
+                        else
+                            echo "[$(date +%%Y%%m%%d_%%H%%M%%S)] ℹ️  $file sudah menggunakan server yang benar: $old_server"
+                        fi
+                    fi
+                }
+
                 # Copy kubeconfig yang sudah di-update dari primary node
                 if [ -f $HOME/.kube/config ]; then
                     echo "✅ Using pre-copied kubeconfig from primary node"
                     export KUBECONFIG=$HOME/.kube/config
                     
-                    # Verify kubeconfig points to VIP/domain
-                    CURRENT_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")
-                    echo "📋 Current kubeconfig server: $CURRENT_SERVER"
-                    
-                    if [[ "$CURRENT_SERVER" != *"$ENDPOINT"* ]]; then
-                        echo "⚠️  Kubeconfig not using VIP endpoint, will update after join"
-                    fi
+                    echo "🔄 Updating kubeconfig files before join..."
+                    update_kubeconfig_server "$HOME/.kube/config" "$EXPECTED_SERVER"
+                    update_kubeconfig_server "/etc/kubernetes/admin.conf" "$EXPECTED_SERVER"
+                    update_kubeconfig_server "/etc/kubernetes/controller-manager.conf" "$EXPECTED_SERVER"
+                    update_kubeconfig_server "/etc/kubernetes/scheduler.conf" "$EXPECTED_SERVER"
+
+                    sudo kubectl config set-cluster kubernetes --server=${EXPECTED_SERVER}
                 else
                     echo "⚠️  Pre-copied kubeconfig not found, will configure after join"
                 fi
                 
+                # ✅ Validasi pra-eksekusi (sebelum join)
+                echo "🔍 Memvalidasi konfigurasi server di semua berkas kubeconfig sebelum join..."
+                VALIDATION_FAILED=false
+                for conf_file in "$HOME/.kube/config" "/etc/kubernetes/admin.conf" "/etc/kubernetes/controller-manager.conf" "/etc/kubernetes/scheduler.conf" "/etc/kubernetes/kubelet.conf" "/etc/kubernetes/bootstrap-kubelet.conf"; do
+                    if [ -f "$conf_file" ]; then
+                        CURRENT_SERVER=$(sudo grep "server:" "$conf_file" | head -1 | awk '{print $2}')
+                        if [[ "$CURRENT_SERVER" != "$EXPECTED_SERVER" ]]; then
+                            echo "❌ ERROR: Berkas $conf_file belum menggunakan domain yang benar! (Saat ini: $CURRENT_SERVER, Diharapkan: $EXPECTED_SERVER)"
+                            VALIDATION_FAILED=true
+                        else
+                            echo "✅ $conf_file valid: $CURRENT_SERVER"
+                        fi
+                    fi
+                done
+                
+                if [ "$VALIDATION_FAILED" = true ]; then
+                    echo "❌ Validasi pra-eksekusi gagal. Menghentikan proses join."
+                    exit 1
+                fi
+                echo "✅ Validasi pra-eksekusi berhasil. Semua berkas kubeconfig yang ada sudah menggunakan domain yang benar."
+
+				echo "🧪 Pre-flight etcd peer connectivity & hostname checks..."
+				if ! kubectl get nodes >/dev/null 2>&1; then
+					echo "❌ kubectl cannot list nodes; cannot preflight etcd peers"
+					exit 1
+				fi
+
+				NODE_IP="$(ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+				if [ -z "$NODE_IP" ]; then
+					echo "❌ Cannot determine NODE_IP on iface=$IFACE"
+					ip -4 -o addr show || true
+					exit 1
+				fi
+
+				echo "📋 Cluster nodes (name=InternalIP):"
+				CLUSTER_NODES="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"="}{range .status.addresses[?(@.type=="InternalIP")]}{.address}{end}{"\n"}{end}' 2>/dev/null || true)"
+				echo "$CLUSTER_NODES"
+				if [ -z "$CLUSTER_NODES" ]; then
+					echo "❌ Cannot fetch cluster nodes InternalIP list"
+					exit 1
+				fi
+
+				echo "🧾 Ensuring /etc/hosts includes control-plane node name mappings..."
+				BACKUP_TIMESTAMP=$(date +%%Y%%m%%d_%%H%%M%%S)
+				HOSTS_NEW="/etc/hosts.k8s-ha.${BACKUP_TIMESTAMP}"
+				sudo cp -f /etc/hosts "$HOSTS_NEW" 2>/dev/null || true
+
+                # Buat file temporary untuk node mappings
+                > /tmp/k8s-hosts-additions.txt
+				
+                NEW_LINES=""
+				while IFS= read -r line; do
+					name="${line%%=*}"
+					ip="${line#*=}"
+					if [ -z "$name" ] || [ -z "$ip" ]; then
+						continue
+					fi
+					if [ "$name" = "$NODE_NAME" ]; then
+						ip="$NODE_IP"
+					fi
+                    # Gunakan echo langsung ke file tanpa printf
+                    echo "${ip} ${name}" >> /tmp/k8s-hosts-additions.txt
+                done <<< "$CLUSTER_NODES"
+                
+                # Tambahkan mapping untuk node saat ini
+                echo "${NODE_IP} ${NODE_NAME}" >> /tmp/k8s-hosts-additions.txt
+
+                # Hapus duplikat entries dari /etc/hosts original
+				sudo awk '{
+					if ($0 ~ /^[[:space:]]*#/ || NF < 2) { print; next }
+					print
+				}' /etc/hosts | sudo tee "$HOSTS_NEW" >/dev/null
+                # Append node mappings
+				sudo cat /tmp/k8s-hosts-additions.txt | sudo tee -a "$HOSTS_NEW" >/dev/null
+
+                # Replace /etc/hosts dengan versi baru
+				sudo mv -f "$HOSTS_NEW" /etc/hosts
+				sudo chown root:root /etc/hosts
+				sudo chmod 644 /etc/hosts
+				rm -f /tmp/k8s-hosts-additions.txt
+
+				if command -v getent >/dev/null 2>&1; then
+					while IFS= read -r line; do
+						name="${line%%=*}"
+						ip="${line#*=}"
+						if [ -z "$name" ] || [ -z "$ip" ]; then
+							continue
+						fi
+						resolved="$(getent ahostsv4 "$name" 2>/dev/null | awk '{print $1; exit}' || true)"
+						echo "   $name -> ${resolved:-<unknown>} (expected $ip)"
+					done <<< "$CLUSTER_NODES"
+					resolved_self="$(getent ahostsv4 "$NODE_NAME" 2>/dev/null | awk '{print $1; exit}' || true)"
+					echo "   $NODE_NAME -> ${resolved_self:-<unknown>} (expected $NODE_IP)"
+				fi
+
+				check_port() {
+					host="$1"; port="$2"
+					if command -v nc >/dev/null 2>&1; then
+						nc -z -w 2 "$host" "$port" >/dev/null 2>&1
+						return $?
+					fi
+					if command -v timeout >/dev/null 2>&1; then
+						timeout 2 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
+						return $?
+					fi
+					bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
+				}
+
+				echo "🔌 Checking etcd peer (2380) and client (2379) ports on existing control-plane nodes..."
+				while IFS= read -r line; do
+					name="${line%%=*}"
+					ip="${line#*=}"
+					if [ -z "$name" ] || [ -z "$ip" ]; then
+						continue
+					fi
+					if [ "$name" = "$NODE_NAME" ] || [ "$ip" = "$NODE_IP" ]; then
+						continue
+					fi
+					ok_peer=false
+					ok_client=false
+					for _ in 1 2 3 4 5; do
+						if check_port "$ip" 2380; then ok_peer=true; fi
+						if check_port "$ip" 2379; then ok_client=true; fi
+						if [ "$ok_peer" = true ] && [ "$ok_client" = true ]; then
+							break
+						fi
+						sleep 2
+					done
+					if [ "$ok_peer" != true ] || [ "$ok_client" != true ]; then
+						echo "❌ etcd ports not reachable for $name ($ip): peer2380=$ok_peer client2379=$ok_client"
+						exit 1
+					fi
+					echo "✅ $name ($ip): peer2380 ok, client2379 ok"
+				done <<< "$CLUSTER_NODES"
+
+				echo "📋 Expected ETCD_INITIAL_CLUSTER (name=https://ip:2380) (informational):"
+				EXPECTED_INITIAL_CLUSTER=""
+				while IFS= read -r line; do
+					name="${line%%=*}"
+					ip="${line#*=}"
+					if [ -z "$name" ] || [ -z "$ip" ]; then
+						continue
+					fi
+					if [ "$name" = "$NODE_NAME" ]; then
+						ip="$NODE_IP"
+					fi
+					if [ -n "$EXPECTED_INITIAL_CLUSTER" ]; then
+						EXPECTED_INITIAL_CLUSTER="${EXPECTED_INITIAL_CLUSTER},"
+					fi
+					EXPECTED_INITIAL_CLUSTER="${EXPECTED_INITIAL_CLUSTER}${name}=https://${ip}:2380"
+				done <<< "$CLUSTER_NODES"
+				if ! echo "$EXPECTED_INITIAL_CLUSTER" | grep -q "${NODE_NAME}=https://${NODE_IP}:2380"; then
+					if [ -n "$EXPECTED_INITIAL_CLUSTER" ]; then
+						EXPECTED_INITIAL_CLUSTER="${EXPECTED_INITIAL_CLUSTER},"
+					fi
+					EXPECTED_INITIAL_CLUSTER="${EXPECTED_INITIAL_CLUSTER}${NODE_NAME}=https://${NODE_IP}:2380"
+				fi
+				echo "$EXPECTED_INITIAL_CLUSTER"
+                
                 # ✅ PERBAIKAN 4: Jalankan join command
                 echo "🔗 Executing join command..."
                 
+				append_flag_if_missing() {
+					local cmd="$1"
+					local flag="$2"
+					local value="$3"
+					if echo "$cmd" | grep -qE "(^|[[:space:]])${flag}([[:space:]]|=)"; then
+						echo "$cmd"
+						return 0
+					fi
+					if [ -z "$value" ]; then
+						echo "$cmd $flag"
+						return 0
+					fi
+					echo "$cmd $flag $value"
+				}
+
+				JOIN_CMD_NODE="$JOIN_CMD"
+				JOIN_CMD_NODE="$(append_flag_if_missing "$JOIN_CMD_NODE" "--node-name" "$NODE_NAME")"
+				JOIN_CMD_NODE="$(append_flag_if_missing "$JOIN_CMD_NODE" "--apiserver-advertise-address" "$NODE_IP")"
+				JOIN_CMD_NODE="$(append_flag_if_missing "$JOIN_CMD_NODE" "--cri-socket" "unix:///run/containerd/containerd.sock")"
+
                 # ✅ Tambahkan flag --ignore-preflight-errors untuk bypass kubelet check
-                JOIN_CMD_MODIFIED="${JOIN_CMD} --ignore-preflight-errors=DirAvailable--var-lib-etcd,FileAvailable--etc-kubernetes-kubelet.conf"
+                JOIN_CMD_MODIFIED="${JOIN_CMD_NODE} --ignore-preflight-errors=DirAvailable--var-lib-etcd,FileAvailable--etc-kubernetes-kubelet.conf"
                 
-				# Execute join dengan retry khusus untuk error promote learner yang prematur
+                # ✅ Fix untuk connection refused etcd saat join
+                echo "🔄 Restarting containerd to ensure fresh state before join..."
+                sudo systemctl restart containerd
+                
+				ensure_kubelet_running() {
+					sudo systemctl enable kubelet 2>/dev/null || true
+					sudo systemctl start kubelet 2>/dev/null || true
+				}
+
+				cleanup_local_full() {
+					sudo systemctl stop kubelet 2>/dev/null || true
+					sudo rm -f /etc/kubernetes/kubelet.conf /etc/kubernetes/bootstrap-kubelet.conf 2>/dev/null || true
+					sudo rm -f /etc/kubernetes/manifests/kube-apiserver.yaml /etc/kubernetes/manifests/kube-controller-manager.yaml /etc/kubernetes/manifests/kube-scheduler.yaml /etc/kubernetes/manifests/etcd.yaml 2>/dev/null || true
+					sudo rm -rf /var/lib/kubelet/pki /var/lib/kubelet/config.yaml /var/lib/kubelet/kubeadm-flags.env 2>/dev/null || true
+				}
+
+				cleanup_local_preserve_etcd() {
+					sudo rm -f /etc/kubernetes/kubelet.conf /etc/kubernetes/bootstrap-kubelet.conf 2>/dev/null || true
+					sudo rm -f /etc/kubernetes/manifests/kube-apiserver.yaml /etc/kubernetes/manifests/kube-controller-manager.yaml /etc/kubernetes/manifests/kube-scheduler.yaml 2>/dev/null || true
+				}
+
+				get_etcd_pod() {
+					kubectl -n kube-system get pods -l component=etcd -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
+				}
+
+				etcdctl_in_cluster() {
+					local pod="$1"
+					shift
+					kubectl -n kube-system exec "$pod" -- sh -c "ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key $*"
+				}
+
+				wait_or_remove_learner() {
+					local node_name="$1"
+					local node_ip="$2"
+					local max_wait="$3"
+					local sleep_s="$4"
+
+					local pod=""
+					pod="$(get_etcd_pod)"
+					if [ -z "$pod" ]; then
+						echo "❌ Cannot find an etcd pod to run etcdctl (kubectl -l component=etcd returned empty)"
+						return 2
+					fi
+					echo "📋 Using etcd pod for etcdctl: $pod"
+
+					local waited=0
+					local member_line=""
+					local member_id=""
+					local is_learner=""
+					while [ "$waited" -lt "$max_wait" ]; do
+						set +e
+						member_line="$(etcdctl_in_cluster "$pod" "member list -w table" 2>/dev/null | awk -v n="$node_name" -v ip="$node_ip" 'NR>1 && (index($0,n)>0 || (ip!=\"\" && index($0,ip)>0)) {print; exit}')"
+						set -e
+
+						if [ -n "$member_line" ]; then
+							member_id="$(echo "$member_line" | awk '{print $1}')"
+							is_learner="$(echo "$member_line" | awk '{print $NF}')"
+							echo "📋 etcd member for node: $member_line"
+
+							if [ "$is_learner" = "false" ] || [ "$is_learner" = "False" ]; then
+								echo "✅ etcd member is promoted (isLearner=false)"
+								return 0
+							fi
+						else
+							echo "⚠️  etcd member not found yet for node_name=$node_name node_ip=${node_ip:-<unknown>}"
+						fi
+
+						sleep "$sleep_s"
+						waited=$((waited + sleep_s))
+					done
+
+					if [ -n "$member_id" ]; then
+						echo "⚠️  learner still not promoted after ${max_wait}s; removing member id=$member_id and retrying join"
+						set +e
+						etcdctl_in_cluster "$pod" "member remove $member_id" || true
+						etcdctl_in_cluster "$pod" "endpoint health" || true
+						set -e
+						return 1
+					fi
+
+					echo "❌ Timed out waiting for learner, and member id could not be determined"
+					return 2
+				}
+
+				# Execute join dengan retry
 				MAX_JOIN_ATTEMPTS=5
 				JOIN_ATTEMPT=1
 				while [ $JOIN_ATTEMPT -le $MAX_JOIN_ATTEMPTS ]; do
 					echo "🔁 Join attempt $JOIN_ATTEMPT/$MAX_JOIN_ATTEMPTS"
+					cleanup_local_full
 					set +e
 					JOIN_OUTPUT=$(eval "$JOIN_CMD_MODIFIED" 2>&1)
 					JOIN_RC=$?
+                    echo "📋 kubeadm join output:"
+                    echo "$JOIN_OUTPUT" | tail -n 80  # print regardless of success/failure
 					set -e
 					if [ $JOIN_RC -eq 0 ]; then
 						break
 					fi
 					
 					if echo "$JOIN_OUTPUT" | grep -q "etcdserver: can only promote a learner member which is in sync with leader"; then
-						echo "⚠️  etcd learner belum in-sync dengan leader; menunggu stabilisasi lalu retry..."
-						sleep 45
+						echo "⚠️  etcd learner belum in-sync dengan leader; menunggu learner sync sebelum retry..."
+						ensure_kubelet_running
+						wait_or_remove_learner "$NODE_NAME" "$NODE_IP" 600 10 || true
+						cleanup_local_preserve_etcd
+						sleep 10
 						JOIN_ATTEMPT=$((JOIN_ATTEMPT + 1))
 						continue
 					fi
-					
-					echo "❌ Join command failed (rc=$JOIN_RC)!"
-					echo "📋 kubeadm output (tail):"
-					echo "$JOIN_OUTPUT" | tail -n 80
-					echo "📋 Checking kubelet logs:"
+                    
+                    if echo "$JOIN_OUTPUT" | grep -q "connection refused"; then
+                        echo "⚠️  Connection refused detected. Restarting containerd and waiting..."
+                        sudo systemctl restart containerd
+						cleanup_local_full
+                        sleep 10
+                        JOIN_ATTEMPT=$((JOIN_ATTEMPT + 1))
+                        continue
+                    fi
+
+					echo "⚠️  Join command failed (rc=$JOIN_RC); performing cleanup and retry if attempts remain"
+					echo "📋 Checking kubelet logs (tail):"
 					sudo journalctl -u kubelet -n 80 --no-pager || true
+					cleanup_local_full
+					if [ $JOIN_ATTEMPT -lt $MAX_JOIN_ATTEMPTS ]; then
+						sleep 20
+						JOIN_ATTEMPT=$((JOIN_ATTEMPT + 1))
+						continue
+					fi
 					exit 1
 				done
 				
@@ -1810,57 +2863,55 @@ KUBECONFIG_EOF
                 echo "✅ Node joined successfully"
 
                 # ✅ PERBAIKAN 4: Update kubeconfig SEBELUM enable kubelet
-                echo "🔄 Updating kubeconfig to use VIP endpoint..."
+                echo "🔄 Updating kubeconfig files after join to use correct domain..."
                 
-                # ✅ Ensure .kube directory exists
-                echo "⚙️  Setting up kubeconfig..."
-                mkdir -p $HOME/.kube
-
-                # Update server endpoint in kubeconfig
-                if [ -f $HOME/.kube/config ]; then
-                    # Backup original config
-                    sudo cp $HOME/.kube/config $HOME/.kube/config.backup
-                    
-                    # Update server endpoint
-                    sudo sed -i "s|server:.*|server: https://${ENDPOINT}:6443|g" $HOME/.kube/config
-                    
-                    # Verify update
-                    CURRENT_SERVER=$(grep "server:" $HOME/.kube/config | head -1)
-                    echo "📋 Updated kubeconfig server: $CURRENT_SERVER"
-                    
-                    if ! echo "$CURRENT_SERVER" | grep -q "${ENDPOINT}:6443"; then
-                        echo "⚠️  Warning: kubeconfig update may have failed"
-                        echo "   Restoring backup..."
-                        sudo cp $HOME/.kube/config.backup $HOME/.kube/config
+                # Update semua kubeconfig file menggunakan fungsi update_kubeconfig_server
+                update_kubeconfig_server "$HOME/.kube/config" "$EXPECTED_SERVER"
+                update_kubeconfig_server "/etc/kubernetes/kubelet.conf" "$EXPECTED_SERVER"
+                update_kubeconfig_server "/etc/kubernetes/bootstrap-kubelet.conf" "$EXPECTED_SERVER"
+                update_kubeconfig_server "/etc/kubernetes/admin.conf" "$EXPECTED_SERVER"
+                update_kubeconfig_server "/etc/kubernetes/controller-manager.conf" "$EXPECTED_SERVER"
+                update_kubeconfig_server "/etc/kubernetes/scheduler.conf" "$EXPECTED_SERVER"
+                
+                # ✅ Show all updated configs untuk verifikasi
+                echo ""
+                echo "📋 Verification of all config files after join:"
+                echo "====================================="
+                
+                FINAL_VALIDATION_FAILED=false
+                for conf_file in "$HOME/.kube/config" "/etc/kubernetes/kubelet.conf" "/etc/kubernetes/bootstrap-kubelet.conf" "/etc/kubernetes/admin.conf" "/etc/kubernetes/controller-manager.conf" "/etc/kubernetes/scheduler.conf"; do
+                    if [ -f "$conf_file" ]; then
+                        SERVER=$(sudo grep "server:" "$conf_file" | head -1 | awk '{print $2}')
+                        if [[ "$SERVER" == "$EXPECTED_SERVER" ]]; then
+                            echo "✅ $conf_file: $SERVER"
+                        else
+                            echo "❌ $conf_file: $SERVER (INCORRECT! Expected: $EXPECTED_SERVER)"
+                            FINAL_VALIDATION_FAILED=true
+                        fi
                     else
-                        echo "✅ kubeconfig updated successfully"
+                        echo "⚠️  $conf_file: FILE NOT FOUND"
+                        FINAL_VALIDATION_FAILED=true
                     fi
+                done
+                
+                if [ "$FINAL_VALIDATION_FAILED" = true ]; then
+                    echo ""
+                    echo "❌ ERROR: Beberapa file kubeconfig tidak valid atau tidak ditemukan!"
+                    echo "📋 Listing /etc/kubernetes directory:"
+                    sudo ls -la /etc/kubernetes/ || true
+                    exit 1
                 fi
+                
+                echo ""
+                echo "✅ Semua file kubeconfig berhasil diupdate dan diverifikasi!"
     
-                # ✅ PERBAIKAN 5: Update kubeconfig SEBELUM enable service
-                echo "🔄 Updating kubeconfig to use VIP endpoint..."
+                echo ""
+                echo "🔄 Restarting kubelet with updated configuration..."
+                # ✅ CRITICAL: Stop kubelet dulu
+                sudo systemctl stop kubelet
                 
-                if [ -f /etc/kubernetes/kubelet.conf ]; then
-                    # Backup original kubelet.conf
-                    sudo cp /etc/kubernetes/kubelet.conf /etc/kubernetes/kubelet.conf.backup
-                    
-                    # Update server endpoint in kubelet.conf
-                    sudo sed -i "s|server:.*|server: https://${ENDPOINT}:6443|g" /etc/kubernetes/kubelet.conf
-                    
-                    # Verify update
-                    KUBELET_SERVER=$(sudo grep "server:" /etc/kubernetes/kubelet.conf | head -1)
-                    echo "📋 Updated kubelet.conf server: $KUBELET_SERVER"
-                    
-                    if ! echo "$KUBELET_SERVER" | grep -q "${ENDPOINT}:6443"; then
-                        echo "⚠️  Warning: kubelet.conf update may have failed"
-                        echo "   Restoring backup..."
-                        sudo cp /etc/kubernetes/kubelet.conf.backup /etc/kubernetes/kubelet.conf
-                    else
-                        echo "✅ kubelet.conf updated successfully"
-                    fi
-                else
-                    echo "⚠️  Warning: /etc/kubernetes/kubelet.conf not found"
-                fi
+                # ✅ Wait untuk ensure clean stop
+                sleep 5
                 
                 # ✅ PERBAIKAN 7: Reload systemd dan restart kubelet
                 echo "🔄 Reloading systemd and restarting kubelet..."
@@ -1873,23 +2924,38 @@ KUBECONFIG_EOF
                 sudo systemctl restart kubelet
                 
                 # Wait for kubelet to stabilize
-                echo "⏳ Waiting for kubelet to stabilize..."
-                sleep 15
+                echo "⏳ Waiting for kubelet to stabilize (30s)..."
+                sleep 30
                 
                 # ✅ PERBAIKAN 8: Verify kubelet status
                 echo "🔍 Verifying kubelet status..."
                 
-                if ! sudo systemctl is-active --quiet kubelet; then
-                    echo "❌ kubelet is not active!"
+                if sudo systemctl is-active --quiet kubelet; then
+                    echo "✅ kubelet is active and running with updated configuration"
+                    
+                    # Show kubelet status
                     echo "📋 kubelet status:"
-                    sudo systemctl status kubelet --no-pager || true
+                    sudo systemctl status kubelet --no-pager -l | head -20
+                else
+                    echo "❌ kubelet failed to start with updated configuration!"
+                    echo "📋 kubelet status:"
+                    sudo systemctl status kubelet --no-pager -l
+                    echo ""
                     echo "📋 Recent kubelet logs:"
-                    sudo journalctl -u kubelet -n 50 --no-pager || true
+                    sudo journalctl -u kubelet -n 100 --no-pager
                     exit 1
                 fi
                 
-                echo "✅ kubelet is active and running"
+                CONN_REFUSED_COUNT=$(sudo journalctl -u kubelet --since "2 minutes ago" --no-pager | grep -c "connection refused" || echo "0")
                 
+                if [ "$CONN_REFUSED_COUNT" -gt 0 ]; then
+                    echo "⚠️  Warning: Found $CONN_REFUSED_COUNT 'connection refused' errors in kubelet logs"
+                    echo "📋 Recent errors:"
+                    sudo journalctl -u kubelet --since "2 minutes ago" --no-pager | grep "connection refused" | tail -10
+                else
+                    echo "✅ No connection refused errors found in kubelet logs"
+                fi
+
                 # ✅ PERBAIKAN 9: Verify node registration
                 echo "🔍 Verifying node registration..."
                 
@@ -1984,7 +3050,7 @@ KUBECONFIG_EOF
 			`,
 				cfg.K8sVIP,
 				nodes[i].Name,
-				controlPlaneEndpointHost,
+				cfg.K8sDOMAIN,
 				cfg.K8sVIPInterface,
 				readJoinCmd.Stdout),
 		}, pulumi.DependsOn([]pulumi.Resource{

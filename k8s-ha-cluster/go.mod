@@ -6,6 +6,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/pulumi/pulumi-command/sdk v1.2.0
 	github.com/pulumi/pulumi/sdk/v3 v3.214.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -87,6 +88,5 @@ require (
 	google.golang.org/grpc v1.72.1 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/frand v1.4.2 // indirect
 )
